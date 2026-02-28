@@ -37,7 +37,7 @@ DOMAIN_Y = (0.0, 420.0)
 NUM_OBSTACLES = 4
 NUM_REGIONS = 12
 CURRENT_ALGORITHM = "hierarchical_v1"
-SCENARIO_PROFILES = ("random", "corridor", "clustered", "split-corners")
+SCENARIO_PROFILES = ("random", "clustered", "split-corners")
 TASK_BASE_SECONDS = {"low": 2.0, "mid": 4.0, "high": 8.0}
 TASK_LEVEL_CN = {"low": "下", "mid": "中", "high": "上"}
 TASK_LEVELS = ("low", "mid", "high")
@@ -123,6 +123,9 @@ USV_DISPLAY_PALETTE = (
     "#0369a1",
     "#ea580c",
 )
+EXTREME_EVENT_ENABLED = True
+EXTREME_EVENT_INVESTIGATE_TOL = 10.0
+EXTREME_EVENT_ASSESS_STEPS = 5
 
 
 @dataclass
@@ -473,6 +476,43 @@ def _coefficient_of_variation(values: Sequence[float]) -> float:
     return sqrt(var) / mean
 
 
+def _difficulty_from_risk_score(score: float) -> str:
+    if score >= 0.72:
+        return "high"
+    if score >= 0.45:
+        return "mid"
+    return "low"
+
+
+def _assess_extreme_event_site(
+    point: Tuple[float, float],
+    env: Environment,
+    grid_xy: Sequence[Tuple[float, float]],
+    latent_risk: Sequence[float],
+    sim_time: float,
+) -> Tuple[float, str, float, float]:
+    idx = nearest_cell_index(grid_xy, point)
+    base_latent = float(latent_risk[idx]) if 0 <= idx < len(latent_risk) else 0.0
+    cx, cy = env.current.velocity(point[0], point[1], sim_time)
+    current_mag = sqrt(cx * cx + cy * cy)
+    current_term = min(1.0, current_mag / 2.2)
+    obstacle_clear = _min_obstacle_clearance(point[0], point[1], env)
+    obstacle_term = exp(-obstacle_clear / 34.0)
+    edge_clear = _edge_clearance(point[0], point[1], env)
+    edge_term = exp(-edge_clear / 48.0)
+    score = min(
+        1.0,
+        max(
+            0.0,
+            0.44 * base_latent + 0.26 * current_term + 0.18 * obstacle_term + 0.12 * edge_term,
+        ),
+    )
+    difficulty = _difficulty_from_risk_score(score)
+    severity = min(1.0, max(0.78, 0.76 + 0.28 * score))
+    radius = 10.0 + 8.0 * score
+    return score, difficulty, severity, radius
+
+
 def _segment_obstacle_penalty(
     p0: Tuple[float, float],
     p1: Tuple[float, float],
@@ -734,30 +774,6 @@ def _sample_anchor_regions(
     return regions
 
 
-def _sample_corridor_obstacles(
-    rng: random.Random,
-    xlim: Tuple[float, float],
-    ylim: Tuple[float, float],
-) -> List[ObstacleRect]:
-    xmin, xmax = xlim
-    ymin, ymax = ylim
-    pad = 16.0
-    x1 = rng.uniform(xmin + 170.0, xmin + 196.0)
-    x2 = rng.uniform(xmin + 350.0, xmin + 382.0)
-    w1 = rng.uniform(24.0, 30.0)
-    w2 = rng.uniform(24.0, 32.0)
-    g1 = rng.uniform(ymin + 112.0, ymin + 148.0)
-    g2 = rng.uniform(ymin + 272.0, ymin + 306.0)
-    gh1 = rng.uniform(30.0, 38.0)
-    gh2 = rng.uniform(30.0, 38.0)
-    return [
-        ObstacleRect(x1 - w1 * 0.5, x1 + w1 * 0.5, ymin + pad, g1 - gh1),
-        ObstacleRect(x1 - w1 * 0.5, x1 + w1 * 0.5, g1 + gh1, ymax - pad),
-        ObstacleRect(x2 - w2 * 0.5, x2 + w2 * 0.5, ymin + pad, g2 - gh2),
-        ObstacleRect(x2 - w2 * 0.5, x2 + w2 * 0.5, g2 + gh2, ymax - pad),
-    ]
-
-
 def _sample_clustered_obstacles(
     rng: random.Random,
     xlim: Tuple[float, float],
@@ -794,19 +810,6 @@ def _sample_regions_for_profile(
     obstacles: Sequence[ObstacleRect],
     scenario_profile: str,
 ) -> List[DetectionRegion]:
-    if scenario_profile == "corridor":
-        anchors = (
-            [(170.0, 130.0, 16.0)] * 4
-            + [(374.0, 286.0, 16.0)] * 4
-            + [
-                (86.0, 336.0, 14.0),
-                (502.0, 86.0, 14.0),
-                (110.0, 84.0, 14.0),
-                (500.0, 338.0, 14.0),
-            ]
-        )
-        return _sample_anchor_regions(rng, env, obstacles, anchors=anchors)
-
     if scenario_profile == "clustered":
         c1 = (rng.uniform(126.0, 206.0), rng.uniform(104.0, 188.0))
         c2 = (rng.uniform(352.0, 440.0), rng.uniform(234.0, 318.0))
@@ -849,9 +852,7 @@ def build_large_mission(seed: int, scenario_profile: str = "random"):
         (34.0, 34.0),
         (34.0, 360.0),
     ]
-    if scenario_profile == "corridor":
-        obstacles = _sample_corridor_obstacles(rng, DOMAIN_X, DOMAIN_Y)
-    elif scenario_profile == "clustered":
+    if scenario_profile == "clustered":
         obstacles = _sample_clustered_obstacles(rng, DOMAIN_X, DOMAIN_Y)
     elif scenario_profile == "split-corners":
         obstacles = _sample_split_corner_obstacles(rng, DOMAIN_X, DOMAIN_Y)
@@ -2113,7 +2114,7 @@ def _write_run_log(
         )
     lines.append("")
 
-    lines.append("=== Task Definitions (12 tasks) ===")
+    lines.append(f"=== Task Definitions ({len(regions)} tasks) ===")
     lines.append("format: label | true_difficulty | known_difficulty | base_sec | discovered_by@time | pos(x,y)")
     for rg in sorted(regions, key=lambda r: _task_label_key(r.label)):
         base_sec = TASK_BASE_SECONDS[rg.difficulty]
@@ -2304,11 +2305,107 @@ def run_mission_once(
     usv_prev_assigned: Dict[str, bool] = {usv.name: False for usv in usvs}
     usv_prev_omega_cmd: Dict[str, float] = {usv.name: 0.0 for usv in usvs}
     usv_turn_intent_sign: Dict[str, float] = {usv.name: 0.0 for usv in usvs}
+    destroyed_usv_names: set[str] = set()
+    emergency_region_count = 0
+    extreme_event_fired = False
+    extreme_event_step_idx: int | None = None
+    extreme_event_usv_name: str | None = None
+    extreme_event_point: Tuple[float, float] | None = None
+    emergency_uav_name: str | None = None
+    emergency_uav_target: Tuple[float, float] | None = None
+    emergency_uav_mode = "idle"  # idle -> dispatch -> assess -> done
+    emergency_assess_countdown = 0
+    emergency_assessed_label: str | None = None
+    destroyed_events: List[Dict[str, float | str]] = []
+
+    def _active_usv_by_name() -> Dict[str, AgentRunner]:
+        return {
+            name: usv
+            for name, usv in usv_by_name.items()
+            if name not in destroyed_usv_names
+        }
+
+    def _mark_usv_destroyed(name: str) -> None:
+        if name in destroyed_usv_names:
+            return
+        destroyed_usv_names.add(name)
+        usv = usv_by_name[name]
+        usv.state = AgentState(
+            x=usv.state.x,
+            y=usv.state.y,
+            psi=usv.state.psi,
+            v=0.0,
+            energy=0.0,
+        )
+        usv.waypoints = [(usv.state.x, usv.state.y)]
+        usv.wp_index = 0
+        usv_task_lock[name] = None
+        usv_hold_anchor[name] = None
+        usv_prev_assigned[name] = False
+        usv_prev_omega_cmd[name] = 0.0
+        usv_turn_intent_sign[name] = 0.0
+        for q in task_lock_order.values():
+            if name in q:
+                q.remove(name)
+        for lbl, owners in task_assignment_active.items():
+            if name in owners:
+                task_assignment_active[lbl] = [nm for nm in owners if nm != name]
+        for lbl, owners in task_assignment_latest.items():
+            if name in owners:
+                task_assignment_latest[lbl] = [nm for nm in owners if nm != name]
+
+    def _register_emergency_region(
+        point: Tuple[float, float],
+        difficulty: str,
+        severity: float,
+        radius: float,
+        discovered_by: str,
+        discovered_time: float,
+    ) -> str:
+        nonlocal emergency_region_count, latent_risk
+        emergency_region_count += 1
+        suffix = chr(ord("A") + (emergency_region_count - 1) % 26)
+        label = f"Emergency-{suffix}"
+        rg = DetectionRegion(
+            x=point[0],
+            y=point[1],
+            radius=radius,
+            severity=severity,
+            label=label,
+            difficulty=difficulty,
+        )
+        regions.append(rg)
+        region_lookup[label] = rg
+        task_labels_ordered.append(label)
+        task_labels_ordered.sort(key=lambda s: (_task_label_key(s), s))
+        processing_required[label] = float(TASK_BASE_SECONDS.get(difficulty, TASK_BASE_SECONDS["mid"]))
+        processing_progress[label] = 0.0
+        processing_done_time[label] = None
+        first_hit_time[label] = None
+        known_difficulty_by_task[label] = difficulty
+        difficulty_discovered_by[label] = discovered_by
+        difficulty_discovered_time[label] = discovered_time
+        max_contributors_by_region[label] = 0
+        task_assignment_latest[label] = []
+        task_assignment_active[label] = []
+        task_lock_order[label] = []
+        latent_risk = risk_map_from_regions(stage1.grid_xy, regions)
+        return label
 
     def do_replan() -> None:
         nonlocal replan_count, latest_partition, latest_priority_map, latest_detected_regions
         nonlocal latest_final_paths, latest_priority_counts
         nonlocal active_partition_snapshot_idx
+
+        active_usv_by_name = _active_usv_by_name()
+        if not active_usv_by_name:
+            latest_priority_map = []
+            latest_detected_regions = []
+            latest_final_paths = {}
+            latest_priority_counts = {name: 0 for name in usv_by_name.keys()}
+            for rg in regions:
+                task_assignment_active[rg.label] = []
+            return
 
         current_global_map = stage1.coverage_quality
         _, priority_map, detected_regions = make_priority_and_detection(
@@ -2325,7 +2422,7 @@ def run_mission_once(
             p = _difficulty_priority(known)
             priority_map[idx] = min(1.0, priority_map[idx] + 0.16 * p)
 
-        usv_states = {a.name: a.state for a in usvs}
+        usv_states = {name: usv.state for name, usv in active_usv_by_name.items()}
         partition = weighted_voronoi_partition(
             grid_xy=stage1.grid_xy,
             states=usv_states,
@@ -2621,7 +2718,10 @@ def run_mission_once(
         latest_priority_map = priority_map
         latest_detected_regions = detected_regions
         latest_final_paths = final_paths
-        latest_priority_counts = {name: len(priority_by_usv.get(name, [])) for name in usv_states.keys()}
+        latest_priority_counts = {
+            name: len(priority_by_usv.get(name, [])) if name in usv_states else 0
+            for name in usv_by_name.keys()
+        }
         task_assignment_active.clear()
         for rg in regions:
             owners = sorted(assignment_by_task.get(rg.label, set()))
@@ -2652,45 +2752,130 @@ def run_mission_once(
     executed_steps = 0
     stage1_snapshot_step = min(n_steps, profile.max_execute_steps)
     track_interval = max(2, int(args.track_interval))
+    extreme_event_enabled = bool(getattr(args, "extreme_event", EXTREME_EVENT_ENABLED))
+    extreme_event_rng = random.Random((mission_seed * 977 + 17) % 2_147_483_647)
+    event_window_start = max(18, stage1_snapshot_step // 3)
+    event_window_end = max(event_window_start, int(0.8 * stage1_snapshot_step))
+    extreme_event_trigger_step = (
+        extreme_event_rng.randint(event_window_start, event_window_end)
+        if extreme_event_enabled
+        else -1
+    )
 
     for step_idx in range(profile.max_execute_steps):
         # UAV and USV run simultaneously from the first step.
         discovery_changed = False
         detections = []
+        if (not extreme_event_fired) and step_idx == extreme_event_trigger_step:
+            active_usv_list = [u for u in usvs if u.name not in destroyed_usv_names]
+            if active_usv_list:
+                victim = extreme_event_rng.choice(active_usv_list)
+                extreme_event_fired = True
+                extreme_event_step_idx = step_idx + 1
+                extreme_event_usv_name = victim.name
+                extreme_event_point = (victim.state.x, victim.state.y)
+                _mark_usv_destroyed(victim.name)
+                destroyed_events.append(
+                    {
+                        "name": victim.name,
+                        "x": float(extreme_event_point[0]),
+                        "y": float(extreme_event_point[1]),
+                        "time": float((step_idx + 1) * sim.dt),
+                    }
+                )
+                emergency_uav_name = min(
+                    uavs,
+                    key=lambda u: (u.state.x - extreme_event_point[0]) ** 2 + (u.state.y - extreme_event_point[1]) ** 2,
+                ).name
+                emergency_uav_target = extreme_event_point
+                emergency_uav_mode = "dispatch"
+                emergency_assess_countdown = 0
+                emergency_assessed_label = None
+                uav_identify_target[emergency_uav_name] = None
+                uav_identify_countdown[emergency_uav_name] = 0
+                print(
+                    "[extreme-event] "
+                    f"step={extreme_event_step_idx}, destroyed={extreme_event_usv_name}, "
+                    f"loc=({extreme_event_point[0]:.1f},{extreme_event_point[1]:.1f}), "
+                    f"uav_dispatch={emergency_uav_name}"
+                )
         for uav in uavs:
             prev_x = uav.state.x
             prev_y = uav.state.y
-            hold = uav_identify_countdown[uav.name]
-            if hold > 0:
-                ctrl = Control(a=0.0, omega=0.0)
-                uav_identify_countdown[uav.name] = hold - 1
-                if uav_identify_countdown[uav.name] == 0:
-                    label = uav_identify_target[uav.name]
-                    if label is not None and known_difficulty_by_task.get(label) is None:
-                        rg = region_lookup[label]
-                        known_difficulty_by_task[label] = rg.difficulty
-                        difficulty_discovered_by[label] = uav.name
-                        difficulty_discovered_time[label] = (step_idx + 1) * sim.dt
-                        discovery_changed = True
-                    uav_identify_target[uav.name] = None
-            else:
-                candidate: DetectionRegion | None = None
-                best_d2 = 1e30
-                for rg in regions:
-                    if known_difficulty_by_task.get(rg.label) is not None:
-                        continue
-                    d2 = (uav.state.x - rg.x) ** 2 + (uav.state.y - rg.y) ** 2
-                    near_r = max(uav_identify_radius, 0.52 * float(uav.params.sensor.radius), rg.radius + 2.0)
-                    if d2 <= near_r * near_r and d2 < best_d2:
-                        best_d2 = d2
-                        candidate = rg
-                if candidate is not None:
-                    uav_identify_target[uav.name] = candidate.label
-                    uav_identify_countdown[uav.name] = uav_hold_steps_required
-                    ctrl = Control(a=0.0, omega=0.0)
+            if (
+                uav.name == emergency_uav_name
+                and emergency_uav_target is not None
+                and emergency_uav_mode in ("dispatch", "assess")
+            ):
+                dx_evt = emergency_uav_target[0] - uav.state.x
+                dy_evt = emergency_uav_target[1] - uav.state.y
+                dist_evt = sqrt(dx_evt * dx_evt + dy_evt * dy_evt)
+                if emergency_uav_mode == "dispatch":
+                    if dist_evt <= EXTREME_EVENT_INVESTIGATE_TOL:
+                        emergency_uav_mode = "assess"
+                        emergency_assess_countdown = EXTREME_EVENT_ASSESS_STEPS
+                        ctrl = Control(a=0.0, omega=0.0)
+                    else:
+                        ctrl = uav_holonomic_control(uav.state, emergency_uav_target, uav.params.v_max)
                 else:
-                    uav.maybe_advance_waypoint(tol=10.0)
-                    ctrl = uav_holonomic_control(uav.state, uav.current_target(), uav.params.v_max)
+                    ctrl = Control(a=0.0, omega=0.0)
+                    emergency_assess_countdown = max(0, emergency_assess_countdown - 1)
+                    if emergency_assess_countdown == 0 and emergency_assessed_label is None:
+                        score, difficulty, severity, radius = _assess_extreme_event_site(
+                            point=emergency_uav_target,
+                            env=env,
+                            grid_xy=stage1.grid_xy,
+                            latent_risk=latent_risk,
+                            sim_time=(step_idx + 1) * sim.dt,
+                        )
+                        emergency_assessed_label = _register_emergency_region(
+                            point=emergency_uav_target,
+                            difficulty=difficulty,
+                            severity=severity,
+                            radius=radius,
+                            discovered_by=f"{uav.name}_event_assess",
+                            discovered_time=(step_idx + 1) * sim.dt,
+                        )
+                        emergency_uav_mode = "done"
+                        discovery_changed = True
+                        print(
+                            "[extreme-event] "
+                            f"uav_assessed={uav.name}, label={emergency_assessed_label}, "
+                            f"risk_score={score:.3f}, difficulty={difficulty}, "
+                            f"radius={radius:.1f}, severity={severity:.2f}"
+                        )
+            else:
+                hold = uav_identify_countdown[uav.name]
+                if hold > 0:
+                    ctrl = Control(a=0.0, omega=0.0)
+                    uav_identify_countdown[uav.name] = hold - 1
+                    if uav_identify_countdown[uav.name] == 0:
+                        label = uav_identify_target[uav.name]
+                        if label is not None and known_difficulty_by_task.get(label) is None:
+                            rg = region_lookup[label]
+                            known_difficulty_by_task[label] = rg.difficulty
+                            difficulty_discovered_by[label] = uav.name
+                            difficulty_discovered_time[label] = (step_idx + 1) * sim.dt
+                            discovery_changed = True
+                        uav_identify_target[uav.name] = None
+                else:
+                    candidate: DetectionRegion | None = None
+                    best_d2 = 1e30
+                    for rg in regions:
+                        if known_difficulty_by_task.get(rg.label) is not None:
+                            continue
+                        d2 = (uav.state.x - rg.x) ** 2 + (uav.state.y - rg.y) ** 2
+                        near_r = max(uav_identify_radius, 0.52 * float(uav.params.sensor.radius), rg.radius + 2.0)
+                        if d2 <= near_r * near_r and d2 < best_d2:
+                            best_d2 = d2
+                            candidate = rg
+                    if candidate is not None:
+                        uav_identify_target[uav.name] = candidate.label
+                        uav_identify_countdown[uav.name] = uav_hold_steps_required
+                        ctrl = Control(a=0.0, omega=0.0)
+                    else:
+                        uav.maybe_advance_waypoint(tol=10.0)
+                        ctrl = uav_holonomic_control(uav.state, uav.current_target(), uav.params.v_max)
             uav.state = step_agent(uav.state, ctrl, uav.params, env, sim.dt, t)
             uav_trajectories[uav.name].append(uav.state)
             detections.append(uav_detection(stage1.grid_xy, uav.state, uav.params.sensor))
@@ -2737,7 +2922,7 @@ def run_mission_once(
         if discovery_changed:
             discovered_labels_now = {label for label, diff in known_difficulty_by_task.items() if diff is not None}
             _inject_missing_region_waypoints(
-                usv_by_name,
+                _active_usv_by_name(),
                 regions,
                 processing_done_time,
                 known_difficulty_by_task,
@@ -2749,7 +2934,7 @@ def run_mission_once(
         if (step_idx + 1) % track_interval == 0:
             discovered_labels_now = {label for label, diff in known_difficulty_by_task.items() if diff is not None}
             _inject_missing_region_waypoints(
-                usv_by_name,
+                _active_usv_by_name(),
                 regions,
                 processing_done_time,
                 known_difficulty_by_task,
@@ -2771,10 +2956,16 @@ def run_mission_once(
             nm
             for owners in task_assignment_active.values()
             for nm in owners
+            if nm not in destroyed_usv_names
         }
         pre_positions = {u.name: (u.state.x, u.state.y) for u in usvs}
         resolved_positions: Dict[str, Tuple[float, float]] = {}
         for usv in sorted(usvs, key=lambda a: a.name):
+            if usv.name in destroyed_usv_names:
+                usv_trajectories[usv.name].append(usv.state)
+                resolved_positions[usv.name] = (usv.state.x, usv.state.y)
+                usv_prev_assigned[usv.name] = False
+                continue
             if usv_detour_cooldown.get(usv.name, 0) > 0:
                 usv_detour_cooldown[usv.name] = max(0, usv_detour_cooldown[usv.name] - 1)
             other_positions = list(resolved_positions.values()) + [
@@ -3179,7 +3370,7 @@ def run_mission_once(
             usv_dist_sum_cum += dist
             usv_turn_sum_cum += abs(wrap_to_pi(cur.psi - prev.psi))
         usv_discovery_changed = _update_region_processing(
-            usvs=usvs,
+            usvs=[u for u in usvs if u.name not in destroyed_usv_names],
             regions=regions,
             processing_progress=processing_progress,
             processing_done_time=processing_done_time,
@@ -3196,7 +3387,7 @@ def run_mission_once(
             do_replan()
             discovered_labels_now = {label for label, diff in known_difficulty_by_task.items() if diff is not None}
             _inject_missing_region_waypoints(
-                usv_by_name,
+                _active_usv_by_name(),
                 regions,
                 processing_done_time,
                 known_difficulty_by_task,
@@ -3210,6 +3401,8 @@ def run_mission_once(
                 n = 0
                 rr2 = (1.02 * rg.radius) ** 2
                 for usv in usvs:
+                    if usv.name in destroyed_usv_names:
+                        continue
                     if (usv.state.x - rg.x) ** 2 + (usv.state.y - rg.y) ** 2 <= rr2:
                         n += 1
                 max_contributors_by_region[rg.label] = max(max_contributors_by_region[rg.label], n)
@@ -3217,7 +3410,7 @@ def run_mission_once(
         if (step_idx + 1) % profile.urgent_insert_interval == 0:
             discovered_labels_now = {label for label, diff in known_difficulty_by_task.items() if diff is not None}
             _inject_missing_region_waypoints(
-                usv_by_name,
+                _active_usv_by_name(),
                 regions,
                 processing_done_time,
                 known_difficulty_by_task,
@@ -3360,6 +3553,7 @@ def run_mission_once(
                 agent_states=frame_states,
                 current_model=env.current.as_dict(),
                 agent_colors=agent_colors,
+                destroyed_events=destroyed_events,
                 stage1_end_frame=stage1_end_frame,
                 title=(
                     f"UAV-USV Mission Playback | seed={mission_seed} | "
@@ -3597,6 +3791,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="USV realtime tracking refresh interval (steps) while sharing UAV view.",
+    )
+    parser.add_argument(
+        "--extreme-event",
+        action=argparse.BooleanOptionalAction,
+        default=EXTREME_EVENT_ENABLED,
+        help="Enable one-time random extreme event (destroy one USV, trigger UAV assessment, then replan).",
     )
     parser.add_argument(
         "--visualize",

@@ -106,13 +106,14 @@ class LauncherState:
         algorithm = _clamp_text(config.get("algorithm"), "hierarchical_v1")
         seed_mode = _clamp_text(config.get("seed_mode"), "random")
         seed = _clamp_text(config.get("seed"), "42")
-        scenario = _clamp_text(config.get("scenario_profile"), "corridor")
+        scenario = _clamp_text(config.get("scenario_profile"), "random")
         coverage_goal = _clamp_text(config.get("coverage_goal"), "0.90")
         handling_goal = _clamp_text(config.get("handling_goal"), "1.00")
         stage1_steps = _clamp_text(config.get("stage1_steps"), "420")
         track_interval = _clamp_text(config.get("track_interval"), "4")
         visualize = bool(config.get("visualize", True))
         animate = bool(config.get("animate", True))
+        extreme_event = bool(config.get("extreme_event", True))
 
         cmd = [
             sys.executable,
@@ -143,6 +144,8 @@ class LauncherState:
             cmd.append("--no-visualize")
         if not animate:
             cmd.append("--no-animate")
+        if not extreme_event:
+            cmd.append("--no-extreme-event")
         return cmd, seed_note
 
 
@@ -238,10 +241,9 @@ HTML = """<!doctype html>
           <div class="row">
             <label>Scenario Profile</label>
             <select id="scenario_profile">
-              <option value="corridor" selected>corridor</option>
               <option value="clustered">clustered</option>
               <option value="split-corners">split-corners</option>
-              <option value="random">random</option>
+              <option value="random" selected>random</option>
             </select>
           </div>
           <div class="row">
@@ -276,6 +278,8 @@ HTML = """<!doctype html>
             <label for="visualize">Export SVG</label>
             <input id="animate" type="checkbox" checked />
             <label for="animate">Export Animation HTML</label>
+            <input id="extreme_event" type="checkbox" checked />
+            <label for="extreme_event">Enable Extreme Event</label>
           </div>
           <div class="btns">
             <button id="runBtn">Run</button>
@@ -314,7 +318,8 @@ HTML = """<!doctype html>
         stage1_steps: document.getElementById("stage1_steps").value,
         track_interval: document.getElementById("track_interval").value,
         visualize: document.getElementById("visualize").checked,
-        animate: document.getElementById("animate").checked
+        animate: document.getElementById("animate").checked,
+        extreme_event: document.getElementById("extreme_event").checked
       };
     }
 

@@ -476,6 +476,7 @@ def save_mission_animation_html(
     stage1_end_frame: int,
     current_model: Dict[str, float | bool] | None = None,
     agent_colors: Dict[str, str] | None = None,
+    destroyed_events: Sequence[Dict[str, float | str]] | None = None,
     title: str = "UAV-USV Mission Animation",
 ) -> str:
     payload = {
@@ -513,6 +514,15 @@ def save_mission_animation_html(
         "states": {k: [[x, y, psi] for (x, y, psi) in v] for k, v in agent_states.items()},
         "current_model": dict(current_model or {}),
         "agent_colors": dict(agent_colors or {}),
+        "destroyed_events": [
+            {
+                "name": str(ev.get("name", "")),
+                "x": float(ev.get("x", 0.0)),
+                "y": float(ev.get("y", 0.0)),
+                "time": float(ev.get("time", 0.0)),
+            }
+            for ev in (destroyed_events or [])
+        ],
         "stage1_end": int(stage1_end_frame),
         "title": title,
     }
@@ -695,6 +705,7 @@ def save_mission_animation_html(
     const frameLoadTable = Array.isArray(DATA.frame_load_table) ? DATA.frame_load_table : [];
     const partitionNx = Number(DATA.partition_nx || 0);
     const partitionNy = Number(DATA.partition_ny || 0);
+    const destroyedEvents = Array.isArray(DATA.destroyed_events) ? DATA.destroyed_events : [];
     const canDrawPartition = (
       partitionNx >= 2
       && partitionNy >= 2
@@ -836,6 +847,21 @@ def save_mission_animation_html(
       ctx.strokeStyle = "#7c2d12";
       ctx.lineWidth = 1.2;
       ctx.stroke();
+    }}
+
+    function drawDestroyedCross(x, y) {{
+      const [px, py] = toPx(x, y);
+      const r = 10;
+      ctx.save();
+      ctx.strokeStyle = "#dc2626";
+      ctx.lineWidth = 3.2;
+      ctx.beginPath();
+      ctx.moveTo(px - r, py - r);
+      ctx.lineTo(px + r, py + r);
+      ctx.moveTo(px - r, py + r);
+      ctx.lineTo(px + r, py - r);
+      ctx.stroke();
+      ctx.restore();
     }}
 
     function currentVel(x, y, tm) {{
@@ -1032,6 +1058,15 @@ def save_mission_animation_html(
         ctx.fillStyle = "#0f172a";
         ctx.font = "12px sans-serif";
         ctx.fillText(name, lx + 8, ly - 8);
+      }});
+
+      destroyedEvents.forEach((ev) => {{
+        const et = Number(ev.time);
+        const ex = Number(ev.x);
+        const ey = Number(ev.y);
+        if (!Number.isFinite(et) || !Number.isFinite(ex) || !Number.isFinite(ey)) return;
+        if (tm < et) return;
+        drawDestroyedCross(ex, ey);
       }});
 
       const stage = frameIdx <= DATA.stage1_end ? "Stage 1 (UAV Mapping)" : "Stage 2-3 (Joint Online)";
