@@ -77,6 +77,7 @@ def weighted_voronoi_partition(
     params_map: Dict[str, AgentParams],
     env: Environment,
     priority_map: Sequence[float] | None = None,
+    active_mask: Sequence[bool] | None = None,
     cfg: WeightedVoronoiConfig | None = None,
     current_time: float = 0.0,
 ) -> VoronoiPartitionResult:
@@ -91,6 +92,10 @@ def weighted_voronoi_partition(
         priority_map = [0.5] * len(grid_xy)
     if len(priority_map) != len(grid_xy):
         raise ValueError("priority_map length must match grid size")
+    if active_mask is None:
+        active_mask = [True] * len(grid_xy)
+    if len(active_mask) != len(grid_xy):
+        raise ValueError("active_mask length must match grid size")
 
     max_energy = max(max(s.energy, 1.0) for s in states.values())
     owner_by_cell: List[str] = []
@@ -101,6 +106,11 @@ def weighted_voronoi_partition(
     cells_by_agent: Dict[str, List[Tuple[float, float]]] = {name: [] for name in agent_names}
 
     for idx, point in enumerate(grid_xy):
+        if not bool(active_mask[idx]):
+            owner_by_cell.append("")
+            cost_by_cell.append(0.0)
+            continue
+
         px, py = point
         pscore = float(priority_map[idx])
         best_name = agent_names[0]

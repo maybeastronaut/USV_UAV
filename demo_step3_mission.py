@@ -21,7 +21,6 @@ from maritime_coverage import (
     SimulationConfig,
     WeightedVoronoiConfig,
     WindField,
-    fused_detection,
     plan_heterogeneous_paths,
     save_mission_animation_html,
     save_partition_svg,
@@ -37,7 +36,17 @@ DOMAIN_Y = (0.0, 420.0)
 NUM_OBSTACLES = 4
 NUM_REGIONS = 12
 CURRENT_ALGORITHM = "hierarchical_v1"
-SCENARIO_PROFILES = ("random", "clustered", "split-corners")
+CURRENT_REASSIGN_ALGORITHM = "potential_event"
+REASSIGN_ALGORITHMS = ("potential_event", "heuristic", "auction_cbba")
+SCENARIO_PROFILES = ("random", "clustered", "split-corners", "high-coupling")
+HIGH_COUPLING_BOOTSTRAP_DISCOVERY = False
+HIGH_COUPLING_EVENT_WINDOW_START_RATIO = 0.10
+HIGH_COUPLING_EVENT_WINDOW_END_RATIO = 0.28
+HIGH_COUPLING_EXTRA_EMERGENCY_TASKS = 2
+HIGH_COUPLING_SAFE_DISTANCE = 12.5
+HIGH_COUPLING_USV_VMAX_SCALE = 0.88
+HIGH_COUPLING_REPLAN_INTERVAL_STEPS = 18
+HIGH_COUPLING_WARMUP_REPLAN_STEPS = 8
 TASK_BASE_SECONDS = {"low": 2.0, "mid": 4.0, "high": 8.0}
 TASK_LEVEL_CN = {"low": "下", "mid": "中", "high": "上"}
 TASK_LEVELS = ("low", "mid", "high")
@@ -68,6 +77,12 @@ ASSIGNMENT_WAIT_AGE_CAP_SECONDS = 22.0
 ASSIGNMENT_NON_EDGE_TASK_MARGIN = 56.0
 ASSIGNMENT_EDGE_PENALTY_TRIGGER = 48.0
 ASSIGNMENT_EDGE_PENALTY_SECONDS_PER_M = 0.24
+ASSIGNMENT_AUCTION_BACKLOG_WEIGHT = 0.70
+ASSIGNMENT_AUCTION_QUEUE_SOFT_CAP = 5
+ASSIGNMENT_AUCTION_UNHIT_BONUS_SECONDS = 8.0
+ASSIGNMENT_AUCTION_FORCE_FIRST_RESPONSE_SECONDS = 36.0
+ASSIGNMENT_AUCTION_STARVATION_TRIGGER_SECONDS = 96.0
+ASSIGNMENT_AUCTION_RESCUE_BACKLOG_WEIGHT = 0.45
 TASK_CAPTURE_RADIUS_RATIO = 1.35
 TASK_LOCK_ANCHOR_RATIO = 0.62
 TASK_QUEUE_RADIUS_RATIO = 1.28
@@ -126,6 +141,7 @@ USV_DISPLAY_PALETTE = (
 EXTREME_EVENT_ENABLED = True
 EXTREME_EVENT_INVESTIGATE_TOL = 10.0
 EXTREME_EVENT_ASSESS_STEPS = 5
+EMERGENCY_LABEL_PREFIX = "Emergency-"
 
 
 @dataclass
@@ -182,6 +198,7 @@ class AlgorithmProfile:
 class MissionSummary:
     mission_seed: int
     profile_name: str
+    reassign_algorithm: str
     scenario_profile: str
     sea_width: float
     sea_height: float
@@ -839,11 +856,46 @@ def _sample_regions_for_profile(
         )
         return _sample_anchor_regions(rng, env, obstacles, anchors=anchors)
 
+    if scenario_profile == "high-coupling":
+        # High-coupling pressure: keep obstacle generation unchanged, but densify tasks
+        # into nearby clusters to increase concurrent contention and coupling.
+        c1 = (rng.uniform(196.0, 252.0), rng.uniform(134.0, 262.0))
+        c2 = (
+            min(446.0, max(118.0, c1[0] + rng.uniform(48.0, 84.0))),
+            min(344.0, max(78.0, c1[1] + rng.uniform(-36.0, 36.0))),
+        )
+        c3 = (
+            0.5 * (c1[0] + c2[0]) + rng.uniform(-16.0, 16.0),
+            0.5 * (c1[1] + c2[1]) + rng.uniform(-22.0, 22.0),
+        )
+        anchors = [(c1[0], c1[1], 18.0)] * 5 + [(c2[0], c2[1], 18.0)] * 4 + [(c3[0], c3[1], 16.0)] * 3
+        regions = _sample_anchor_regions(
+            rng,
+            env,
+            obstacles,
+            anchors=anchors,
+            radius_min=8.0,
+            radius_max=12.2,
+            min_gap_extra=4.5,
+        )
+        for rg in regions:
+            p = rng.random()
+            if p < 0.74:
+                difficulty = "high"
+            elif p < 0.97:
+                difficulty = "mid"
+            else:
+                difficulty = "low"
+            rg.difficulty = difficulty
+            rg.severity = _severity_for_difficulty(rng, difficulty)
+        return regions
+
     return _sample_random_regions(rng, env=env, obstacles=obstacles)
 
 
 def build_large_mission(seed: int, scenario_profile: str = "random"):
     rng = random.Random(seed)
+    high_coupling_mode = scenario_profile == "high-coupling"
 
     start_points = [
         (20.0, 20.0),
@@ -895,7 +947,7 @@ def build_large_mission(seed: int, scenario_profile: str = "random"):
         horizon=560.0,
         nx=112,
         ny=84,
-        safe_distance=10.0,
+        safe_distance=(HIGH_COUPLING_SAFE_DISTANCE if high_coupling_mode else 10.0),
         coverage_threshold=0.72,
         revisit_max_gap=110.0,
         seen_prob_threshold=0.28,
@@ -917,10 +969,11 @@ def build_large_mission(seed: int, scenario_profile: str = "random"):
         kw=0.0,
         sensor=uav_sensor,
     )
+    usv_v_max = 7.8 * (HIGH_COUPLING_USV_VMAX_SCALE if high_coupling_mode else 1.0)
     usv_params = AgentParams(
         agent_type=AgentType.USV,
         v_min=1.8,
-        v_max=7.8,
+        v_max=usv_v_max,
         omega_max=0.52,
         a_max=1.1,
         energy_min=1800.0,
@@ -2051,6 +2104,7 @@ def _write_run_log(
     log_dir: Path,
     mission_seed: int,
     profile_name: str,
+    reassign_algorithm: str,
     scenario_profile: str,
     env: Environment,
     regions: Sequence[DetectionRegion],
@@ -2073,11 +2127,13 @@ def _write_run_log(
     difficulty_discovered_time: Dict[str, float | None],
     task_assignment_latest: Dict[str, List[str]],
     task_assignment_history: Sequence[Tuple[int, Dict[str, List[str]]]],
+    potential_trajectory: Sequence[Dict[str, float | int]],
     max_contributors_by_region: Dict[str, int],
     usv_travel_m: Dict[str, float],
     usv_work_s: Dict[str, float],
     usv_load_eq_m: Dict[str, float],
     load_balance_cv: float,
+    event_metrics: Dict[str, float | int | str | bool | None] | None = None,
 ) -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -2088,6 +2144,7 @@ def _write_run_log(
     lines.append(f"generated_at: {datetime.now().isoformat(timespec='seconds')}")
     lines.append(f"seed: {mission_seed}")
     lines.append(f"algorithm: {profile_name}")
+    lines.append(f"reassign_algorithm: {reassign_algorithm}")
     lines.append(f"scenario_profile: {scenario_profile}")
     lines.append(f"sea_area: {env.xlim[1]-env.xlim[0]:.0f}m x {env.ylim[1]-env.ylim[0]:.0f}m")
     lines.append(f"obstacles: {len(env.obstacles)}")
@@ -2103,6 +2160,72 @@ def _write_run_log(
     lines.append(f"mission_completion_time_s: {mission_completion_time:.2f}")
     lines.append(f"avg_response_time_s: {avg_response_time:.2f}")
     lines.append(f"avg_processing_completion_time_s: {avg_processing_completion_time:.2f}")
+    if event_metrics:
+        def _fmt_event_metric(v: float | int | str | bool | None) -> str:
+            if v is None:
+                return "-"
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            if isinstance(v, int):
+                return str(v)
+            if isinstance(v, float):
+                return f"{v:.4f}"
+            return str(v)
+
+        lines.append("")
+        lines.append("=== Extreme Event Metrics ===")
+        lines.append(f"extreme_event_enabled: {_fmt_event_metric(event_metrics.get('extreme_event_enabled'))}")
+        lines.append(f"extreme_event_fired: {_fmt_event_metric(event_metrics.get('extreme_event_fired'))}")
+        lines.append(f"extreme_event_step: {_fmt_event_metric(event_metrics.get('extreme_event_step'))}")
+        lines.append(f"extreme_event_time_s: {_fmt_event_metric(event_metrics.get('extreme_event_time_s'))}")
+        lines.append(
+            f"extreme_event_destroyed_usv: {_fmt_event_metric(event_metrics.get('extreme_event_destroyed_usv'))}"
+        )
+        lines.append(
+            f"extreme_event_dispatch_uav: {_fmt_event_metric(event_metrics.get('extreme_event_dispatch_uav'))}"
+        )
+        lines.append(f"emergency_task_label: {_fmt_event_metric(event_metrics.get('emergency_task_label'))}")
+        lines.append(f"emergency_assess_time_s: {_fmt_event_metric(event_metrics.get('emergency_assess_time_s'))}")
+        lines.append(
+            "emergency_first_response_time_s: "
+            f"{_fmt_event_metric(event_metrics.get('emergency_first_response_time_s'))}"
+        )
+        lines.append(
+            f"emergency_complete_time_s: {_fmt_event_metric(event_metrics.get('emergency_complete_time_s'))}"
+        )
+        lines.append(f"event_to_assess_s: {_fmt_event_metric(event_metrics.get('event_to_assess_s'))}")
+        lines.append(
+            f"event_to_first_replan_s: {_fmt_event_metric(event_metrics.get('event_to_first_replan_s'))}"
+        )
+        lines.append(
+            f"assess_to_first_replan_s: {_fmt_event_metric(event_metrics.get('assess_to_first_replan_s'))}"
+        )
+        lines.append(
+            f"assess_to_first_response_s: {_fmt_event_metric(event_metrics.get('assess_to_first_response_s'))}"
+        )
+        lines.append(f"assess_to_complete_s: {_fmt_event_metric(event_metrics.get('assess_to_complete_s'))}")
+        lines.append(f"coverage_at_event: {_fmt_event_metric(event_metrics.get('coverage_at_event'))}")
+        lines.append(
+            f"coverage_at_event_plus_120s: {_fmt_event_metric(event_metrics.get('coverage_at_event_plus_120s'))}"
+        )
+        lines.append(
+            f"coverage_recovery_120s: {_fmt_event_metric(event_metrics.get('coverage_recovery_120s'))}"
+        )
+        lines.append(
+            f"task_completion_at_event: {_fmt_event_metric(event_metrics.get('task_completion_at_event'))}"
+        )
+        lines.append(
+            "task_completion_at_event_plus_120s: "
+            f"{_fmt_event_metric(event_metrics.get('task_completion_at_event_plus_120s'))}"
+        )
+        lines.append(
+            f"task_completion_gain_120s: {_fmt_event_metric(event_metrics.get('task_completion_gain_120s'))}"
+        )
+        lines.append(f"turn_index_at_event: {_fmt_event_metric(event_metrics.get('turn_index_at_event'))}")
+        lines.append(
+            f"turn_index_at_event_plus_120s: {_fmt_event_metric(event_metrics.get('turn_index_at_event_plus_120s'))}"
+        )
+        lines.append(f"turn_index_delta_120s: {_fmt_event_metric(event_metrics.get('turn_index_delta_120s'))}")
     lines.append("")
 
     lines.append("=== USV Load Balance ===")
@@ -2159,6 +2282,24 @@ def _write_run_log(
             owners_txt = ",".join(owners) if owners else "-"
             parts.append(f"{rg.label}->{owners_txt}")
         lines.append(f"[replan {ridx:02d}] " + " ; ".join(parts))
+    if potential_trajectory:
+        lines.append("")
+        lines.append("=== Potential Trajectory By Replan ===")
+        lines.append("format: replan | time_s | potential | delta | makespan_s | load_cv | queue_total | pending | unassigned")
+        for row in potential_trajectory:
+            ridx = int(row.get("replan_idx", 0))
+            time_s = float(row.get("time_s", 0.0))
+            potential = float(row.get("potential", 0.0))
+            delta = float(row.get("delta", 0.0))
+            makespan = float(row.get("virtual_makespan_s", 0.0))
+            load_cv = float(row.get("virtual_load_cv", 0.0))
+            queue_total = int(row.get("queue_total", 0))
+            pending = int(row.get("pending_tasks", 0))
+            unassigned = int(row.get("unassigned_tasks", 0))
+            lines.append(
+                f"[replan {ridx:02d}] {time_s:.1f}s | {potential:.4f} | {delta:+.4f} | "
+                f"{makespan:.4f} | {load_cv:.4f} | {queue_total} | {pending} | {unassigned}"
+            )
 
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(out_path)
@@ -2176,6 +2317,9 @@ def run_mission_once(
         scenario_profile=args.scenario_profile,
     )
     stage1 = CoverageProblem(env, sim)
+    reassign_algorithm = str(getattr(args, "reassign_algorithm", CURRENT_REASSIGN_ALGORITHM))
+    if reassign_algorithm not in REASSIGN_ALGORITHMS:
+        raise ValueError(f"Unsupported reassign algorithm '{reassign_algorithm}'. Available: {REASSIGN_ALGORITHMS}")
 
     uav_trajectories: Dict[str, List[AgentState]] = {a.name: [a.state] for a in uavs}
     uav_params = {a.name: a.params for a in uavs}
@@ -2215,8 +2359,9 @@ def run_mission_once(
                 if diff is not None
             }
         )
+        # Use active assignment to avoid showing stale sticky owners in animation.
         frame_task_assignment.append(
-            {label: list(task_assignment_latest.get(label, [])) for label in task_labels_ordered}
+            {label: list(task_assignment_active.get(label, [])) for label in task_labels_ordered}
         )
         uav_cov_now = stage1.coverage_quality
         usv_cov_now = [1.0 - m for m in usv_miss]
@@ -2244,7 +2389,7 @@ def run_mission_once(
 
     t = 0.0
     n_steps = max(1, int(args.stage1_steps))
-    latent_risk = risk_map_from_regions(stage1.grid_xy, regions)
+    latent_risk = [0.0] * len(stage1.grid_xy)
 
     usv_params = {a.name: a.params for a in usvs}
     usv_by_name = {a.name: a for a in usvs}
@@ -2255,8 +2400,47 @@ def run_mission_once(
     usv_work_s: Dict[str, float] = {a.name: 0.0 for a in usvs}
     usv_turn_sum_cum = 0.0
     usv_dist_sum_cum = 0.0
+    local_coverage_intensity: Dict[str, List[float]] = {
+        ag.name: [0.0] * grid_size
+        for ag in all_runners
+    }
+
+    def _accumulate_local_coverage(agent_name: str, detection_prob: Sequence[float], dt: float) -> None:
+        local = local_coverage_intensity.get(agent_name)
+        if local is None:
+            return
+        n = min(len(local), len(detection_prob))
+        for i in range(n):
+            q = float(detection_prob[i])
+            if q <= 0.0:
+                continue
+            local[i] += q * dt
+
+    def _sync_shared_coverage_from_locals() -> bool:
+        if not local_coverage_intensity:
+            return False
+        prev = stage1.coverage_intensity
+        shared = [0.0] * grid_size
+        for local in local_coverage_intensity.values():
+            for i, val in enumerate(local):
+                if val > shared[i]:
+                    shared[i] = val
+        changed = False
+        for i, val in enumerate(shared):
+            if abs(val - prev[i]) > 1e-9:
+                changed = True
+                break
+        if changed:
+            stage1.coverage_intensity = shared
+        return changed
+
+    def _shared_observed_mask(min_intensity: float | None = None) -> List[bool]:
+        if min_intensity is None:
+            min_intensity = max(1e-4, 0.45 * sim.seen_prob_threshold * sim.dt)
+        return [float(v) >= float(min_intensity) for v in stage1.coverage_intensity]
 
     replan_count = 0
+    replan_times: List[float] = []
     assign_sum = {a.name: 0 for a in usvs}
 
     latest_partition = None
@@ -2272,6 +2456,7 @@ def run_mission_once(
     # Active assignment map used by online dispatch/injection logic.
     task_assignment_active: Dict[str, List[str]] = {rg.label: [] for rg in regions}
     task_assignment_history: List[Tuple[int, Dict[str, List[str]]]] = []
+    potential_trajectory: List[Dict[str, float | int]] = []
     processing_required: Dict[str, float] = {}
     processing_progress: Dict[str, float] = {}
     processing_done_time: Dict[str, float | None] = {}
@@ -2279,6 +2464,7 @@ def run_mission_once(
     known_difficulty_by_task: Dict[str, str | None] = {}
     difficulty_discovered_by: Dict[str, str | None] = {}
     difficulty_discovered_time: Dict[str, float | None] = {}
+    high_coupling_mode = args.scenario_profile == "high-coupling"
     max_contributors_by_region: Dict[str, int] = {rg.label: 0 for rg in regions}
     for rg in regions:
         processing_required[rg.label] = float(TASK_BASE_SECONDS[rg.difficulty])
@@ -2288,13 +2474,17 @@ def run_mission_once(
         known_difficulty_by_task[rg.label] = None
         difficulty_discovered_by[rg.label] = None
         difficulty_discovered_time[rg.label] = None
+        if high_coupling_mode and HIGH_COUPLING_BOOTSTRAP_DISCOVERY:
+            known_difficulty_by_task[rg.label] = rg.difficulty
+            difficulty_discovered_by[rg.label] = "high_coupling_init"
+            difficulty_discovered_time[rg.label] = 0.0
 
     uav_hold_steps_required = max(1, int(round(1.0 / max(1e-6, sim.dt))))
     # Larger default radius for proactive UAV task identification.
     uav_identify_radius = 24.0
     uav_identify_target: Dict[str, str | None] = {uav.name: None for uav in uavs}
     uav_identify_countdown: Dict[str, int] = {uav.name: 0 for uav in uavs}
-    global_scan_discovery_done = False
+    global_scan_discovery_done = bool(high_coupling_mode and HIGH_COUPLING_BOOTSTRAP_DISCOVERY)
     usv_task_lock: Dict[str, str | None] = {usv.name: None for usv in usvs}
     usv_hold_anchor: Dict[str, Tuple[float, float] | None] = {usv.name: None for usv in usvs}
     task_lock_order: Dict[str, List[str]] = {rg.label: [] for rg in regions}
@@ -2354,6 +2544,14 @@ def run_mission_once(
             if name in owners:
                 task_assignment_latest[lbl] = [nm for nm in owners if nm != name]
 
+    def _refresh_shared_latent_risk() -> None:
+        nonlocal latent_risk
+        known_regions = [rg for rg in regions if known_difficulty_by_task.get(rg.label) is not None]
+        if known_regions:
+            latent_risk = risk_map_from_regions(stage1.grid_xy, known_regions)
+        else:
+            latent_risk = [0.0] * len(stage1.grid_xy)
+
     def _register_emergency_region(
         point: Tuple[float, float],
         difficulty: str,
@@ -2362,7 +2560,7 @@ def run_mission_once(
         discovered_by: str,
         discovered_time: float,
     ) -> str:
-        nonlocal emergency_region_count, latent_risk
+        nonlocal emergency_region_count
         emergency_region_count += 1
         suffix = chr(ord("A") + (emergency_region_count - 1) % 26)
         label = f"Emergency-{suffix}"
@@ -2389,13 +2587,16 @@ def run_mission_once(
         task_assignment_latest[label] = []
         task_assignment_active[label] = []
         task_lock_order[label] = []
-        latent_risk = risk_map_from_regions(stage1.grid_xy, regions)
+        _refresh_shared_latent_risk()
         return label
 
-    def do_replan() -> None:
+    _refresh_shared_latent_risk()
+
+    def do_replan(replan_time_s: float | None = None) -> None:
         nonlocal replan_count, latest_partition, latest_priority_map, latest_detected_regions
         nonlocal latest_final_paths, latest_priority_counts
         nonlocal active_partition_snapshot_idx
+        current_time_s = t if replan_time_s is None else float(replan_time_s)
 
         active_usv_by_name = _active_usv_by_name()
         if not active_usv_by_name:
@@ -2408,11 +2609,13 @@ def run_mission_once(
             return
 
         current_global_map = stage1.coverage_quality
+        visible_regions = [rg for rg in regions if known_difficulty_by_task.get(rg.label) is not None]
+        _refresh_shared_latent_risk()
         _, priority_map, detected_regions = make_priority_and_detection(
             grid_xy=stage1.grid_xy,
             global_coverage=current_global_map,
             latent_risk=latent_risk,
-            regions=regions,
+            regions=visible_regions,
             detection_threshold=profile.detection_threshold,
         )
         priority_map = list(priority_map)
@@ -2423,14 +2626,19 @@ def run_mission_once(
             priority_map[idx] = min(1.0, priority_map[idx] + 0.16 * p)
 
         usv_states = {name: usv.state for name, usv in active_usv_by_name.items()}
+        observed_mask = _shared_observed_mask()
+        if not any(observed_mask):
+            for st in usv_states.values():
+                observed_mask[nearest_cell_index(stage1.grid_xy, (st.x, st.y))] = True
         partition = weighted_voronoi_partition(
             grid_xy=stage1.grid_xy,
             states=usv_states,
             params_map=usv_params,
             env=env,
             priority_map=priority_map,
+            active_mask=observed_mask,
             cfg=profile.voronoi_cfg,
-            current_time=t,
+            current_time=current_time_s,
         )
         cell_indices_by_agent: Dict[str, List[int]] = {name: [] for name in usv_states.keys()}
         for idx, owner in enumerate(partition.owner_by_cell):
@@ -2466,6 +2674,11 @@ def run_mission_once(
         for rg in regions:
             idx = nearest_cell_index(stage1.grid_xy, (rg.x, rg.y))
             owner = partition.owner_by_cell[idx]
+            if owner not in usv_states:
+                owner = min(
+                    usv_states.keys(),
+                    key=lambda n: (usv_states[n].x - rg.x) ** 2 + (usv_states[n].y - rg.y) ** 2,
+                )
             task_owner[rg.label] = owner
             owned_tasks.setdefault(owner, []).append(rg.label)
 
@@ -2491,6 +2704,8 @@ def run_mission_once(
             if rg is None:
                 continue
             known = known_difficulty_by_task.get(label)
+            if known is None:
+                continue
             remaining_work_s = max(
                 0.0,
                 processing_required.get(label, _expected_task_seconds(known))
@@ -2518,6 +2733,7 @@ def run_mission_once(
         ]
         unresolved_regions.sort(
             key=lambda rg: (
+                0 if rg.label.startswith(EMERGENCY_LABEL_PREFIX) else 1,
                 -max(
                     0.0,
                     t - float(difficulty_discovered_time.get(rg.label))
@@ -2551,58 +2767,151 @@ def run_mission_once(
             travel_cache[key] = out
             return out
 
-        for rg in unresolved_regions:
-            known = known_difficulty_by_task.get(rg.label)
-            remaining_work_s = max(
-                0.0,
-                processing_required.get(rg.label, _expected_task_seconds(known))
-                - processing_progress.get(rg.label, 0.0),
-            )
-            if remaining_work_s <= 1e-6:
-                continue
-            task_edge_clear = _edge_clearance(rg.x, rg.y, env)
-            task_is_non_edge = task_edge_clear >= ASSIGNMENT_NON_EDGE_TASK_MARGIN
-            need_n = min(
-                len(usv_states),
-                _required_agents_for_dispatch(known, remaining_work_s),
-                _max_safe_collab_for_region(rg.radius, sim.safe_distance),
-            )
-            owner = task_owner.get(rg.label, list(usv_states.keys())[0])
-            prev_owners = set(task_assignment_active.get(rg.label, []))
-            available = list(usv_states.keys())
-            selected: List[str] = []
-            task_wait_age_s = max(
-                0.0,
-                t - float(difficulty_discovered_time.get(rg.label))
-                if difficulty_discovered_time.get(rg.label) is not None
-                else 0.0,
-            )
-            wait_bonus_s = min(ASSIGNMENT_WAIT_AGE_CAP_SECONDS, ASSIGNMENT_WAIT_AGE_GAIN * task_wait_age_s)
+        def task_wait_age_seconds(task_label: str) -> float:
+            discovered_at = difficulty_discovered_time.get(task_label)
+            if discovered_at is None:
+                return 0.0
+            return max(0.0, t - float(discovered_at))
 
-            for _ in range(max(1, need_n)):
-                if not available:
-                    break
-                eligible = [nm for nm in available if support_ready_by_usv.get(nm, False) or nm == owner]
-                if not eligible:
-                    eligible = [owner] if owner in available else list(available)
+        def starvation_relief_enabled(task_label: str, wait_age_s: float) -> bool:
+            return (
+                high_coupling_mode
+                and first_hit_time.get(task_label) is None
+                and wait_age_s >= ASSIGNMENT_AUCTION_STARVATION_TRIGGER_SECONDS
+            )
 
+        def collab_cap_for_region(rg: DetectionRegion, enable_relief: bool) -> int:
+            del enable_relief
+            return _max_safe_collab_for_region(rg.radius, sim.safe_distance)
+
+        if reassign_algorithm == "heuristic":
+            heuristic_queue_count = dict(virtual_queue_count)
+            for rg in unresolved_regions:
+                known = known_difficulty_by_task.get(rg.label)
+                remaining_work_s = max(
+                    0.0,
+                    processing_required.get(rg.label, _expected_task_seconds(known))
+                    - processing_progress.get(rg.label, 0.0),
+                )
+                if remaining_work_s <= 1e-6:
+                    continue
+                task_wait_age_s = task_wait_age_seconds(rg.label)
+                relief = starvation_relief_enabled(rg.label, task_wait_age_s)
+                need_n = min(
+                    len(usv_states),
+                    _required_agents_for_dispatch(known, remaining_work_s),
+                    collab_cap_for_region(rg, relief),
+                )
+                owner = task_owner.get(rg.label, list(usv_states.keys())[0])
+                prev_owners = set(task_assignment_active.get(rg.label, []))
+                available = list(usv_states.keys())
+                selected: List[str] = []
+
+                for _ in range(max(1, need_n)):
+                    if not available:
+                        break
+                    if relief:
+                        eligible = list(available)
+                    else:
+                        eligible = [nm for nm in available if support_ready_by_usv.get(nm, False) or nm == owner]
+                    if not eligible:
+                        eligible = [owner] if owner in available else list(available)
+                    mean_load = sum(virtual_load_eq.values()) / max(1, len(virtual_load_eq))
+                    best_name: str | None = None
+                    best_cost = 1e30
+                    for name in eligible:
+                        travel_s, travel_dist = travel_eta_seconds(name, rg)
+                        overload = max(0.0, virtual_load_eq[name] - mean_load)
+                        queue_penalty = ASSIGNMENT_QUEUE_SECONDS * float(heuristic_queue_count[name])
+                        load_penalty = ASSIGNMENT_LOAD_SECONDS * overload
+                        owner_bonus = ASSIGNMENT_OWNER_BONUS_SECONDS if (rg.label in detected_labels and name == owner) else 0.0
+                        sticky_bonus = ASSIGNMENT_STICKY_BONUS_SECONDS if name in prev_owners else 0.0
+                        cost = travel_s + queue_penalty + load_penalty - owner_bonus - sticky_bonus
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_name = name
+                    if best_name is None:
+                        break
+                    selected.append(best_name)
+                    available.remove(best_name)
+                    heuristic_queue_count[best_name] = heuristic_queue_count.get(best_name, 0) + 1
+
+                if not selected:
+                    continue
+                if relief:
+                    rescue_name = min(
+                        usv_states.keys(),
+                        key=lambda nm: (
+                            travel_eta_seconds(nm, rg)[0]
+                            + ASSIGNMENT_AUCTION_RESCUE_BACKLOG_WEIGHT * virtual_available_s[nm],
+                            heuristic_queue_count.get(nm, 0),
+                            nm,
+                        ),
+                    )
+                    if rescue_name not in selected:
+                        selected = [rescue_name] + [nm for nm in selected if nm != rescue_name]
+                        selected = selected[: max(1, need_n)]
+
+                n_selected = max(1, len(selected))
+                total_expected = max(1e-6, _expected_task_seconds(known))
+                remain_ratio = min(1.0, remaining_work_s / total_expected)
+                per_agent_work_s = _expected_agent_work_seconds(known, n_selected) * remain_ratio
+                per_agent_work_eq = LOAD_WORK_SECONDS_TO_EQ_M * per_agent_work_s
+                for name in selected:
+                    travel_s, travel_dist = travel_eta_seconds(name, rg)
+                    arrival = virtual_available_s[name] + travel_s
+                    virtual_available_s[name] = max(virtual_available_s[name], arrival) + per_agent_work_s
+                    virtual_load_eq[name] += per_agent_work_eq + LOAD_TRAVEL_COMMIT_RATIO * travel_dist
+                    if rg.label not in queued_labels_by_usv[name]:
+                        priority_by_usv.setdefault(name, []).append((rg.x, rg.y))
+                        queued_labels_by_usv[name].add(rg.label)
+                        virtual_queue_count[name] += 1
+                    assignment_by_task.setdefault(rg.label, set()).add(name)
+        elif reassign_algorithm == "auction_cbba":
+            for rg in unresolved_regions:
+                known = known_difficulty_by_task.get(rg.label)
+                remaining_work_s = max(
+                    0.0,
+                    processing_required.get(rg.label, _expected_task_seconds(known))
+                    - processing_progress.get(rg.label, 0.0),
+                )
+                if remaining_work_s <= 1e-6:
+                    continue
+                task_edge_clear = _edge_clearance(rg.x, rg.y, env)
+                task_is_non_edge = task_edge_clear >= ASSIGNMENT_NON_EDGE_TASK_MARGIN
+                task_wait_age_s = task_wait_age_seconds(rg.label)
+                relief = starvation_relief_enabled(rg.label, task_wait_age_s)
+                need_n = min(
+                    len(usv_states),
+                    _required_agents_for_dispatch(known, remaining_work_s),
+                    collab_cap_for_region(rg, relief),
+                )
+                owner = task_owner.get(rg.label, list(usv_states.keys())[0])
+                prev_owners = set(task_assignment_active.get(rg.label, []))
                 mean_load = sum(virtual_load_eq.values()) / max(1, len(virtual_load_eq))
-                best_name = eligible[0]
-                best_cost = 1e30
-                for name in eligible:
-                    candidate = selected + [name]
-                    n_agents = max(1, len(candidate))
-                    total_expected = max(1e-6, _expected_task_seconds(known))
-                    remain_ratio = min(1.0, remaining_work_s / total_expected)
-                    per_agent_work_s = _expected_agent_work_seconds(known, n_agents) * remain_ratio
+                never_hit = first_hit_time.get(rg.label) is None
+                force_first_response = (
+                    never_hit and task_wait_age_s >= ASSIGNMENT_AUCTION_FORCE_FIRST_RESPONSE_SECONDS
+                )
+                starved_unhit = never_hit and task_wait_age_s >= ASSIGNMENT_AUCTION_STARVATION_TRIGGER_SECONDS
+                wait_bonus_s = min(ASSIGNMENT_WAIT_AGE_CAP_SECONDS, ASSIGNMENT_WAIT_AGE_GAIN * task_wait_age_s)
+                if never_hit:
+                    wait_bonus_s += ASSIGNMENT_AUCTION_UNHIT_BONUS_SECONDS
 
-                    finish_at = 0.0
-                    for nm in candidate:
-                        travel_s, _ = travel_eta_seconds(nm, rg)
-                        arrival = virtual_available_s[nm] + travel_s
-                        finish_at = max(finish_at, arrival)
-                    finish_at += per_agent_work_s
-
+                bids: List[Tuple[float, str]] = []
+                for name in usv_states.keys():
+                    if (not force_first_response) and (not starved_unhit) and (not support_ready_by_usv.get(name, False)) and name != owner:
+                        continue
+                    if (
+                        (not force_first_response)
+                        and (not starved_unhit)
+                        and name != owner
+                        and name not in prev_owners
+                        and virtual_queue_count[name] >= ASSIGNMENT_AUCTION_QUEUE_SOFT_CAP
+                    ):
+                        continue
+                    travel_s, _ = travel_eta_seconds(name, rg)
+                    backlog_s = virtual_available_s[name]
                     overload = max(0.0, virtual_load_eq[name] - mean_load)
                     queue_penalty = ASSIGNMENT_QUEUE_SECONDS * float(virtual_queue_count[name])
                     load_penalty = ASSIGNMENT_LOAD_SECONDS * overload
@@ -2614,45 +2923,192 @@ def run_mission_once(
                             boundary_penalty = (
                                 ASSIGNMENT_EDGE_PENALTY_TRIGGER - edge_clear
                             ) * ASSIGNMENT_EDGE_PENALTY_SECONDS_PER_M
-                    owner_bonus = 0.0
-                    if rg.label in detected_labels and name == owner:
-                        owner_bonus = ASSIGNMENT_OWNER_BONUS_SECONDS
+                    owner_bonus = ASSIGNMENT_OWNER_BONUS_SECONDS if (rg.label in detected_labels and name == owner) else 0.0
                     sticky_bonus = ASSIGNMENT_STICKY_BONUS_SECONDS if name in prev_owners else 0.0
-                    if (not support_ready_by_usv.get(name, False)) and name != owner:
-                        continue
-                    cost = (
-                        finish_at
-                        + queue_penalty
-                        + load_penalty
-                        + boundary_penalty
-                        - owner_bonus
-                        - sticky_bonus
-                        - wait_bonus_s
+                    # Auction-style utility (higher is better): reward ownership/stickiness/urgency,
+                    # penalize travel + backlog + queue/load/boundary costs.
+                    bid = (
+                        owner_bonus
+                        + sticky_bonus
+                        + wait_bonus_s
+                        - travel_s
+                        - ASSIGNMENT_AUCTION_BACKLOG_WEIGHT * backlog_s
+                        - queue_penalty
+                        - load_penalty
+                        - boundary_penalty
                     )
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_name = name
-                selected.append(best_name)
-                available.remove(best_name)
+                    bids.append((bid, name))
 
-            if not selected:
-                continue
+                if not bids:
+                    continue
+                bids.sort(
+                    key=lambda it: (
+                        -it[0],
+                        virtual_available_s[it[1]],
+                        virtual_queue_count[it[1]],
+                        virtual_load_eq[it[1]],
+                        it[1],
+                    )
+                )
+                selected = [name for _, name in bids[: max(1, need_n)]]
+                if not selected:
+                    continue
+                if force_first_response:
+                    rescue_name = min(
+                        usv_states.keys(),
+                        key=lambda nm: (
+                            virtual_available_s[nm] + travel_eta_seconds(nm, rg)[0],
+                            virtual_queue_count[nm],
+                            nm,
+                        ),
+                    )
+                    if rescue_name not in selected:
+                        selected = [rescue_name] + [nm for nm in selected if nm != rescue_name]
+                        selected = selected[: max(1, need_n)]
+                elif starved_unhit:
+                    rescue_name = min(
+                        usv_states.keys(),
+                        key=lambda nm: (
+                            travel_eta_seconds(nm, rg)[0]
+                            + ASSIGNMENT_AUCTION_RESCUE_BACKLOG_WEIGHT * virtual_available_s[nm],
+                            virtual_queue_count[nm],
+                            nm,
+                        ),
+                    )
+                    if rescue_name not in selected:
+                        selected = [rescue_name] + [nm for nm in selected if nm != rescue_name]
+                        selected = selected[: max(1, need_n)]
 
-            n_selected = max(1, len(selected))
-            total_expected = max(1e-6, _expected_task_seconds(known))
-            remain_ratio = min(1.0, remaining_work_s / total_expected)
-            per_agent_work_s = _expected_agent_work_seconds(known, n_selected) * remain_ratio
-            per_agent_work_eq = LOAD_WORK_SECONDS_TO_EQ_M * per_agent_work_s
-            for name in selected:
-                travel_s, travel_dist = travel_eta_seconds(name, rg)
-                arrival = virtual_available_s[name] + travel_s
-                virtual_available_s[name] = max(virtual_available_s[name], arrival) + per_agent_work_s
-                virtual_load_eq[name] += per_agent_work_eq + LOAD_TRAVEL_COMMIT_RATIO * travel_dist
-                if rg.label not in queued_labels_by_usv[name]:
-                    priority_by_usv.setdefault(name, []).append((rg.x, rg.y))
-                    queued_labels_by_usv[name].add(rg.label)
-                    virtual_queue_count[name] += 1
-                assignment_by_task.setdefault(rg.label, set()).add(name)
+                n_selected = max(1, len(selected))
+                total_expected = max(1e-6, _expected_task_seconds(known))
+                remain_ratio = min(1.0, remaining_work_s / total_expected)
+                per_agent_work_s = _expected_agent_work_seconds(known, n_selected) * remain_ratio
+                per_agent_work_eq = LOAD_WORK_SECONDS_TO_EQ_M * per_agent_work_s
+                for name in selected:
+                    travel_s, travel_dist = travel_eta_seconds(name, rg)
+                    arrival = virtual_available_s[name] + travel_s
+                    virtual_available_s[name] = max(virtual_available_s[name], arrival) + per_agent_work_s
+                    virtual_load_eq[name] += per_agent_work_eq + LOAD_TRAVEL_COMMIT_RATIO * travel_dist
+                    if rg.label not in queued_labels_by_usv[name]:
+                        priority_by_usv.setdefault(name, []).append((rg.x, rg.y))
+                        queued_labels_by_usv[name].add(rg.label)
+                        virtual_queue_count[name] += 1
+                    assignment_by_task.setdefault(rg.label, set()).add(name)
+        else:
+            for rg in unresolved_regions:
+                known = known_difficulty_by_task.get(rg.label)
+                remaining_work_s = max(
+                    0.0,
+                    processing_required.get(rg.label, _expected_task_seconds(known))
+                    - processing_progress.get(rg.label, 0.0),
+                )
+                if remaining_work_s <= 1e-6:
+                    continue
+                task_edge_clear = _edge_clearance(rg.x, rg.y, env)
+                task_is_non_edge = task_edge_clear >= ASSIGNMENT_NON_EDGE_TASK_MARGIN
+                task_wait_age_s = task_wait_age_seconds(rg.label)
+                relief = starvation_relief_enabled(rg.label, task_wait_age_s)
+                need_n = min(
+                    len(usv_states),
+                    _required_agents_for_dispatch(known, remaining_work_s),
+                    collab_cap_for_region(rg, relief),
+                )
+                owner = task_owner.get(rg.label, list(usv_states.keys())[0])
+                prev_owners = set(task_assignment_active.get(rg.label, []))
+                available = list(usv_states.keys())
+                selected: List[str] = []
+                wait_bonus_s = min(ASSIGNMENT_WAIT_AGE_CAP_SECONDS, ASSIGNMENT_WAIT_AGE_GAIN * task_wait_age_s)
+
+                for _ in range(max(1, need_n)):
+                    if not available:
+                        break
+                    if relief:
+                        eligible = list(available)
+                    else:
+                        eligible = [nm for nm in available if support_ready_by_usv.get(nm, False) or nm == owner]
+                    if not eligible:
+                        eligible = [owner] if owner in available else list(available)
+
+                    mean_load = sum(virtual_load_eq.values()) / max(1, len(virtual_load_eq))
+                    best_name = eligible[0]
+                    best_cost = 1e30
+                    for name in eligible:
+                        candidate = selected + [name]
+                        n_agents = max(1, len(candidate))
+                        total_expected = max(1e-6, _expected_task_seconds(known))
+                        remain_ratio = min(1.0, remaining_work_s / total_expected)
+                        per_agent_work_s = _expected_agent_work_seconds(known, n_agents) * remain_ratio
+
+                        finish_at = 0.0
+                        for nm in candidate:
+                            travel_s, _ = travel_eta_seconds(nm, rg)
+                            arrival = virtual_available_s[nm] + travel_s
+                            finish_at = max(finish_at, arrival)
+                        finish_at += per_agent_work_s
+
+                        overload = max(0.0, virtual_load_eq[name] - mean_load)
+                        queue_penalty = ASSIGNMENT_QUEUE_SECONDS * float(virtual_queue_count[name])
+                        load_penalty = ASSIGNMENT_LOAD_SECONDS * overload
+                        boundary_penalty = 0.0
+                        if task_is_non_edge:
+                            st = usv_states[name]
+                            edge_clear = _edge_clearance(st.x, st.y, env)
+                            if edge_clear < ASSIGNMENT_EDGE_PENALTY_TRIGGER:
+                                boundary_penalty = (
+                                    ASSIGNMENT_EDGE_PENALTY_TRIGGER - edge_clear
+                                ) * ASSIGNMENT_EDGE_PENALTY_SECONDS_PER_M
+                        owner_bonus = 0.0
+                        if rg.label in detected_labels and name == owner:
+                            owner_bonus = ASSIGNMENT_OWNER_BONUS_SECONDS
+                        sticky_bonus = ASSIGNMENT_STICKY_BONUS_SECONDS if name in prev_owners else 0.0
+                        if (not relief) and (not support_ready_by_usv.get(name, False)) and name != owner:
+                            continue
+                        cost = (
+                            finish_at
+                            + queue_penalty
+                            + load_penalty
+                            + boundary_penalty
+                            - owner_bonus
+                            - sticky_bonus
+                            - wait_bonus_s
+                        )
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_name = name
+                    selected.append(best_name)
+                    available.remove(best_name)
+
+                if not selected:
+                    continue
+                if relief:
+                    rescue_name = min(
+                        usv_states.keys(),
+                        key=lambda nm: (
+                            travel_eta_seconds(nm, rg)[0]
+                            + ASSIGNMENT_AUCTION_RESCUE_BACKLOG_WEIGHT * virtual_available_s[nm],
+                            virtual_queue_count[nm],
+                            nm,
+                        ),
+                    )
+                    if rescue_name not in selected:
+                        selected = [rescue_name] + [nm for nm in selected if nm != rescue_name]
+                        selected = selected[: max(1, need_n)]
+
+                n_selected = max(1, len(selected))
+                total_expected = max(1e-6, _expected_task_seconds(known))
+                remain_ratio = min(1.0, remaining_work_s / total_expected)
+                per_agent_work_s = _expected_agent_work_seconds(known, n_selected) * remain_ratio
+                per_agent_work_eq = LOAD_WORK_SECONDS_TO_EQ_M * per_agent_work_s
+                for name in selected:
+                    travel_s, travel_dist = travel_eta_seconds(name, rg)
+                    arrival = virtual_available_s[name] + travel_s
+                    virtual_available_s[name] = max(virtual_available_s[name], arrival) + per_agent_work_s
+                    virtual_load_eq[name] += per_agent_work_eq + LOAD_TRAVEL_COMMIT_RATIO * travel_dist
+                    if rg.label not in queued_labels_by_usv[name]:
+                        priority_by_usv.setdefault(name, []).append((rg.x, rg.y))
+                        queued_labels_by_usv[name].add(rg.label)
+                        virtual_queue_count[name] += 1
+                    assignment_by_task.setdefault(rg.label, set()).add(name)
 
         assigned_usv_names = {nm for owners in assignment_by_task.values() for nm in owners}
         self_explore_points_by_usv: Dict[str, List[Tuple[float, float]]] = {}
@@ -2695,18 +3151,66 @@ def run_mission_once(
                 min_gap=10.0,
             )
             merged_path = prepend_priority_stops((st.x, st.y), route_sparse, target_stops)
-            final_paths[name] = _sanitize_waypoints_for_env(
+            sanitized_path = _sanitize_waypoints_for_env(
                 merged_path,
                 env=env,
                 boundary_margin=USV_ROUTE_BOUNDARY_MARGIN,
                 min_gap=IDLE_WAYPOINT_MIN_GAP,
-            ) or [(st.x, st.y)]
+            )
+            if not sanitized_path:
+                sanitized_path = _outward_exploration_waypoints(name, st, env)
+            if not sanitized_path:
+                sanitized_path = _fallback_patrol_loop(st, env=env, span=56.0)
+            final_paths[name] = sanitized_path
             usv_by_name[name].waypoints = final_paths[name]
             usv_by_name[name].wp_index = _pick_waypoint_index_for_state(final_paths[name], st)
 
         for name in assign_sum:
             assign_sum[name] += partition.count_by_agent.get(name, 0)
         replan_count += 1
+        replan_times.append(current_time_s)
+        pending_labels = [
+            rg.label
+            for rg in regions
+            if processing_done_time.get(rg.label) is None and rg.label in discovered_labels
+        ]
+        unassigned_tasks = sum(1 for label in pending_labels if not assignment_by_task.get(label))
+        queue_total = int(sum(virtual_queue_count.values()))
+        wait_age_sum_s = 0.0
+        for label in pending_labels:
+            discovered_at = difficulty_discovered_time.get(label)
+            if discovered_at is None:
+                continue
+            wait_age_sum_s += max(0.0, current_time_s - float(discovered_at))
+        virtual_makespan_s = max(virtual_available_s.values()) if virtual_available_s else 0.0
+        virtual_total_load = sum(virtual_load_eq.values())
+        virtual_load_cv = _coefficient_of_variation(list(virtual_load_eq.values()))
+        potential_value = (
+            virtual_makespan_s
+            + 0.08 * virtual_total_load
+            + 32.0 * virtual_load_cv
+            + 6.0 * float(queue_total)
+            + 0.10 * wait_age_sum_s
+            + 120.0 * float(unassigned_tasks)
+        )
+        prev_potential = (
+            float(potential_trajectory[-1]["potential"])
+            if potential_trajectory
+            else potential_value
+        )
+        potential_trajectory.append(
+            {
+                "replan_idx": replan_count,
+                "time_s": current_time_s,
+                "potential": potential_value,
+                "delta": potential_value - prev_potential,
+                "virtual_makespan_s": virtual_makespan_s,
+                "virtual_load_cv": virtual_load_cv,
+                "queue_total": queue_total,
+                "pending_tasks": int(len(pending_labels)),
+                "unassigned_tasks": int(unassigned_tasks),
+            }
+        )
 
         latest_partition = partition
         owner_snapshot = list(partition.owner_by_cell)
@@ -2756,6 +3260,9 @@ def run_mission_once(
     extreme_event_rng = random.Random((mission_seed * 977 + 17) % 2_147_483_647)
     event_window_start = max(18, stage1_snapshot_step // 3)
     event_window_end = max(event_window_start, int(0.8 * stage1_snapshot_step))
+    if high_coupling_mode:
+        event_window_start = max(8, int(stage1_snapshot_step * HIGH_COUPLING_EVENT_WINDOW_START_RATIO))
+        event_window_end = max(event_window_start, int(stage1_snapshot_step * HIGH_COUPLING_EVENT_WINDOW_END_RATIO))
     extreme_event_trigger_step = (
         extreme_event_rng.randint(event_window_start, event_window_end)
         if extreme_event_enabled
@@ -2765,7 +3272,6 @@ def run_mission_once(
     for step_idx in range(profile.max_execute_steps):
         # UAV and USV run simultaneously from the first step.
         discovery_changed = False
-        detections = []
         if (not extreme_event_fired) and step_idx == extreme_event_trigger_step:
             active_usv_list = [u for u in usvs if u.name not in destroyed_usv_names]
             if active_usv_list:
@@ -2836,6 +3342,41 @@ def run_mission_once(
                             discovered_by=f"{uav.name}_event_assess",
                             discovered_time=(step_idx + 1) * sim.dt,
                         )
+                        if high_coupling_mode and HIGH_COUPLING_EXTRA_EMERGENCY_TASKS > 0:
+                            extra_count = 0
+                            for _ in range(HIGH_COUPLING_EXTRA_EMERGENCY_TASKS):
+                                extra_point = emergency_uav_target
+                                picked = False
+                                for _try in range(40):
+                                    ang = extreme_event_rng.uniform(0.0, 2.0 * pi)
+                                    rr = extreme_event_rng.uniform(16.0, 42.0)
+                                    px = emergency_uav_target[0] + rr * cos(ang)
+                                    py = emergency_uav_target[1] + rr * sin(ang)
+                                    px = min(max(px, env.xlim[0] + 12.0), env.xlim[1] - 12.0)
+                                    py = min(max(py, env.ylim[0] + 12.0), env.ylim[1] - 12.0)
+                                    if env.in_obstacle(px, py):
+                                        continue
+                                    if _point_too_close_to_obstacle(px, py, env, margin=4.0):
+                                        continue
+                                    extra_point = (px, py)
+                                    picked = True
+                                    break
+                                extra_difficulty = "high" if extra_count == 0 else "mid"
+                                extra_radius = max(9.0, radius * 0.9)
+                                extra_label = _register_emergency_region(
+                                    point=extra_point,
+                                    difficulty=extra_difficulty,
+                                    severity=_severity_for_difficulty(extreme_event_rng, extra_difficulty),
+                                    radius=extra_radius,
+                                    discovered_by=f"{uav.name}_event_burst",
+                                    discovered_time=(step_idx + 1) * sim.dt,
+                                )
+                                extra_count += 1
+                                print(
+                                    "[extreme-event] "
+                                    f"burst_task={extra_label}, difficulty={extra_difficulty}, "
+                                    f"loc=({extra_point[0]:.1f},{extra_point[1]:.1f}), picked={picked}"
+                                )
                         emergency_uav_mode = "done"
                         discovery_changed = True
                         print(
@@ -2878,7 +3419,8 @@ def run_mission_once(
                         ctrl = uav_holonomic_control(uav.state, uav.current_target(), uav.params.v_max)
             uav.state = step_agent(uav.state, ctrl, uav.params, env, sim.dt, t)
             uav_trajectories[uav.name].append(uav.state)
-            detections.append(uav_detection(stage1.grid_xy, uav.state, uav.params.sensor))
+            q_uav = uav_detection(stage1.grid_xy, uav.state, uav.params.sensor)
+            _accumulate_local_coverage(uav.name, q_uav, sim.dt)
             # Deterministic sweep detection: if UAV track segment passes near a task region,
             # mark it discovered immediately to avoid frame-step misses.
             sweep_base_r = max(uav_identify_radius, 0.70 * float(uav.params.sensor.radius))
@@ -2900,24 +3442,25 @@ def run_mission_once(
                 if uav_identify_target.get(uav.name) == rg.label:
                     uav_identify_target[uav.name] = None
                     uav_identify_countdown[uav.name] = 0
-        stage1.update(fused_detection(detections), sim.dt)
+        _sync_shared_coverage_from_locals()
 
-        # Once the global scan phase ends, promote any remaining unknown tasks
-        # to known so every task point is guaranteed discovered.
+        # End of initial global scan stage.
         if (not global_scan_discovery_done) and (step_idx + 1 >= stage1_snapshot_step):
-            sim_time_now = (step_idx + 1) * sim.dt
-            if finalize_global_scan_discovery(sim_time_now):
-                discovery_changed = True
             global_scan_discovery_done = True
 
         # During initial mapping, replan more frequently for tighter UAV->USV coupling.
-        warmup_replan = max(8, profile.replan_interval_steps // 2)
+        if high_coupling_mode:
+            warmup_replan = max(1, HIGH_COUPLING_WARMUP_REPLAN_STEPS)
+            base_replan = max(1, HIGH_COUPLING_REPLAN_INTERVAL_STEPS)
+        else:
+            warmup_replan = max(8, profile.replan_interval_steps // 2)
+            base_replan = profile.replan_interval_steps
         if step_idx + 1 <= stage1_snapshot_step:
             need_replan = (step_idx + 1) % warmup_replan == 0
         else:
-            need_replan = (step_idx + 1) % profile.replan_interval_steps == 0
+            need_replan = (step_idx + 1) % base_replan == 0
         if need_replan or discovery_changed:
-            do_replan()
+            do_replan(replan_time_s=(step_idx + 1) * sim.dt)
 
         if discovery_changed:
             discovered_labels_now = {label for label, diff in known_difficulty_by_task.items() if diff is not None}
@@ -2950,6 +3493,42 @@ def run_mission_once(
                 q = task_lock_order.get(lbl, [])
                 if nm in q:
                     q.remove(nm)
+                if nm in destroyed_usv_names:
+                    continue
+                usv = usv_by_name.get(nm)
+                if usv is None:
+                    continue
+                assigned_pending = [
+                    rg
+                    for rg in regions
+                    if processing_done_time.get(rg.label) is None
+                    and nm in task_assignment_active.get(rg.label, [])
+                ]
+                if assigned_pending:
+                    next_rg = min(
+                        assigned_pending,
+                        key=lambda rg: (usv.state.x - rg.x) ** 2 + (usv.state.y - rg.y) ** 2,
+                    )
+                    if usv.waypoints:
+                        remaining = usv.waypoints[usv.wp_index :] + usv.waypoints[: usv.wp_index]
+                        remaining = [
+                            p for p in remaining if _dist2(p, (next_rg.x, next_rg.y)) > 8.0 * 8.0
+                        ]
+                    else:
+                        remaining = []
+                    usv.waypoints = [(next_rg.x, next_rg.y)] + remaining
+                    usv.wp_index = 0
+                    if usv.state.v < 0.25:
+                        usv.state = AgentState(
+                            x=usv.state.x,
+                            y=usv.state.y,
+                            psi=usv.state.psi,
+                            v=max(usv.state.v, min(1.0, usv.params.v_max)),
+                            energy=usv.state.energy,
+                        )
+                    usv_idle_stuck_steps[nm] = 0
+                    usv_idle_stuck_anchor[nm] = None
+                    usv_idle_stuck_target[nm] = None
 
         has_discovered_tasks = any(diff is not None for diff in known_difficulty_by_task.values())
         active_assigned_usv = {
@@ -2958,12 +3537,15 @@ def run_mission_once(
             for nm in owners
             if nm not in destroyed_usv_names
         }
-        pre_positions = {u.name: (u.state.x, u.state.y) for u in usvs}
+        pre_positions = {
+            u.name: (u.state.x, u.state.y)
+            for u in usvs
+            if u.name not in destroyed_usv_names
+        }
         resolved_positions: Dict[str, Tuple[float, float]] = {}
         for usv in sorted(usvs, key=lambda a: a.name):
             if usv.name in destroyed_usv_names:
                 usv_trajectories[usv.name].append(usv.state)
-                resolved_positions[usv.name] = (usv.state.x, usv.state.y)
                 usv_prev_assigned[usv.name] = False
                 continue
             if usv_detour_cooldown.get(usv.name, 0) > 0:
@@ -3007,7 +3589,7 @@ def run_mission_once(
                 regions,
                 processing_done_time,
             )
-            if (not currently_assigned) and lock_label is None and completed_target is not None:
+            if lock_label is None and completed_target is not None:
                 # Completed task centers should not remain as idle targets.
                 if usv.waypoints and len(usv.waypoints) > 1:
                     usv.wp_index = (usv.wp_index + 1) % len(usv.waypoints)
@@ -3027,6 +3609,31 @@ def run_mission_once(
                     regions,
                     processing_done_time,
                 )
+            # If this USV is assigned to pending tasks but current target is stale/non-task,
+            # force-insert the nearest assigned pending task to break long idle holds.
+            if currently_assigned and lock_label is None and cur_region is None:
+                assigned_pending = [
+                    rg
+                    for rg in regions
+                    if processing_done_time.get(rg.label) is None
+                    and usv.name in task_assignment_active.get(rg.label, [])
+                ]
+                if assigned_pending:
+                    target_rg = min(
+                        assigned_pending,
+                        key=lambda rg: (usv.state.x - rg.x) ** 2 + (usv.state.y - rg.y) ** 2,
+                    )
+                    if usv.waypoints:
+                        remaining = usv.waypoints[usv.wp_index :] + usv.waypoints[: usv.wp_index]
+                        remaining = [p for p in remaining if _dist2(p, (target_rg.x, target_rg.y)) > 8.0 * 8.0]
+                    else:
+                        remaining = []
+                    usv.waypoints = [(target_rg.x, target_rg.y)] + remaining
+                    usv.wp_index = 0
+                    cur_region = target_rg
+                    usv_idle_stuck_steps[usv.name] = 0
+                    usv_idle_stuck_anchor[usv.name] = None
+                    usv_idle_stuck_target[usv.name] = None
             if lock_label is None:
                 active_rg = _active_region_for_state(usv.state, regions, processing_done_time)
                 if active_rg is None and cur_region is not None:
@@ -3099,6 +3706,7 @@ def run_mission_once(
                         q_det = usv_detection(stage1.grid_xy, usv.state, usv.params.sensor)
                         for i, val in enumerate(q_det):
                             usv_miss[i] *= 1.0 - val
+                        _accumulate_local_coverage(usv.name, q_det, sim.dt)
                         usv_prev_assigned[usv.name] = currently_assigned
                         continue
                 if anchor is not None and _position_conflict(anchor, other_positions, safe_distance=sim.safe_distance):
@@ -3190,6 +3798,7 @@ def run_mission_once(
                 q = usv_detection(stage1.grid_xy, usv.state, usv.params.sensor)
                 for i, val in enumerate(q):
                     usv_miss[i] *= 1.0 - val
+                _accumulate_local_coverage(usv.name, q, sim.dt)
                 usv_prev_assigned[usv.name] = currently_assigned
                 continue
 
@@ -3353,8 +3962,10 @@ def run_mission_once(
             q = usv_detection(stage1.grid_xy, usv.state, usv.params.sensor)
             for i, val in enumerate(q):
                 usv_miss[i] *= 1.0 - val
+            _accumulate_local_coverage(usv.name, q, sim.dt)
             usv_prev_assigned[usv.name] = currently_assigned
 
+        _sync_shared_coverage_from_locals()
         sim_time = (step_idx + 1) * sim.dt
         for usv in usvs:
             traj = usv_trajectories[usv.name]
@@ -3384,7 +3995,7 @@ def run_mission_once(
             dt=sim.dt,
         )
         if usv_discovery_changed:
-            do_replan()
+            do_replan(replan_time_s=sim_time)
             discovered_labels_now = {label for label, diff in known_difficulty_by_task.items() if diff is not None}
             _inject_missing_region_waypoints(
                 _active_usv_by_name(),
@@ -3489,6 +4100,114 @@ def run_mission_once(
     }
     load_balance_cv = _coefficient_of_variation(list(usv_load_eq_m.values()))
 
+    def _sample_series_at_or_before(
+        times: Sequence[float], values: Sequence[float], target_time_s: float
+    ) -> float | None:
+        if not times or not values:
+            return None
+        idx = 0
+        n = min(len(times), len(values))
+        while idx + 1 < n and times[idx + 1] <= target_time_s:
+            idx += 1
+        return float(values[idx])
+
+    event_time_s = float(extreme_event_step_idx * sim.dt) if extreme_event_step_idx is not None else None
+    assess_time_s = (
+        float(difficulty_discovered_time.get(emergency_assessed_label))
+        if emergency_assessed_label is not None and difficulty_discovered_time.get(emergency_assessed_label) is not None
+        else None
+    )
+    first_response_time_s = (
+        float(first_hit_time.get(emergency_assessed_label))
+        if emergency_assessed_label is not None and first_hit_time.get(emergency_assessed_label) is not None
+        else None
+    )
+    emergency_complete_time_s = (
+        float(processing_done_time.get(emergency_assessed_label))
+        if emergency_assessed_label is not None and processing_done_time.get(emergency_assessed_label) is not None
+        else None
+    )
+
+    first_replan_after_event_s = None
+    if event_time_s is not None:
+        later = [tp for tp in replan_times if tp >= event_time_s - 1e-9]
+        if later:
+            first_replan_after_event_s = min(later)
+    first_replan_after_assess_s = None
+    if assess_time_s is not None:
+        later = [tp for tp in replan_times if tp >= assess_time_s - 1e-9]
+        if later:
+            first_replan_after_assess_s = min(later)
+
+    coverage_at_event = None
+    coverage_at_event_plus_120s = None
+    coverage_recovery_120s = None
+    task_completion_at_event = None
+    task_completion_at_event_plus_120s = None
+    task_completion_gain_120s = None
+    turn_index_at_event = None
+    turn_index_at_event_plus_120s = None
+    turn_index_delta_120s = None
+    if event_time_s is not None:
+        event_plus_120s = event_time_s + 120.0
+        coverage_at_event = _sample_series_at_or_before(frame_times, frame_coverage_rate, event_time_s)
+        coverage_at_event_plus_120s = _sample_series_at_or_before(frame_times, frame_coverage_rate, event_plus_120s)
+        task_completion_at_event = _sample_series_at_or_before(frame_times, frame_task_completion_rate, event_time_s)
+        task_completion_at_event_plus_120s = _sample_series_at_or_before(
+            frame_times, frame_task_completion_rate, event_plus_120s
+        )
+        turn_index_at_event = _sample_series_at_or_before(frame_times, frame_turn_rate, event_time_s)
+        turn_index_at_event_plus_120s = _sample_series_at_or_before(frame_times, frame_turn_rate, event_plus_120s)
+        if coverage_at_event is not None and coverage_at_event_plus_120s is not None:
+            coverage_recovery_120s = coverage_at_event_plus_120s - coverage_at_event
+        if task_completion_at_event is not None and task_completion_at_event_plus_120s is not None:
+            task_completion_gain_120s = task_completion_at_event_plus_120s - task_completion_at_event
+        if turn_index_at_event is not None and turn_index_at_event_plus_120s is not None:
+            turn_index_delta_120s = turn_index_at_event_plus_120s - turn_index_at_event
+
+    event_metrics: Dict[str, float | int | str | bool | None] = {
+        "extreme_event_enabled": bool(extreme_event_enabled),
+        "extreme_event_fired": bool(extreme_event_fired),
+        "extreme_event_step": int(extreme_event_step_idx) if extreme_event_step_idx is not None else None,
+        "extreme_event_time_s": event_time_s,
+        "extreme_event_destroyed_usv": extreme_event_usv_name,
+        "extreme_event_dispatch_uav": emergency_uav_name,
+        "emergency_task_label": emergency_assessed_label,
+        "emergency_assess_time_s": assess_time_s,
+        "emergency_first_response_time_s": first_response_time_s,
+        "emergency_complete_time_s": emergency_complete_time_s,
+        "event_to_assess_s": (assess_time_s - event_time_s) if assess_time_s is not None and event_time_s is not None else None,
+        "event_to_first_replan_s": (
+            first_replan_after_event_s - event_time_s
+            if first_replan_after_event_s is not None and event_time_s is not None
+            else None
+        ),
+        "assess_to_first_replan_s": (
+            first_replan_after_assess_s - assess_time_s
+            if first_replan_after_assess_s is not None and assess_time_s is not None
+            else None
+        ),
+        "assess_to_first_response_s": (
+            first_response_time_s - assess_time_s
+            if first_response_time_s is not None and assess_time_s is not None
+            else None
+        ),
+        "assess_to_complete_s": (
+            emergency_complete_time_s - assess_time_s
+            if emergency_complete_time_s is not None and assess_time_s is not None
+            else None
+        ),
+        "coverage_at_event": coverage_at_event,
+        "coverage_at_event_plus_120s": coverage_at_event_plus_120s,
+        "coverage_recovery_120s": coverage_recovery_120s,
+        "task_completion_at_event": task_completion_at_event,
+        "task_completion_at_event_plus_120s": task_completion_at_event_plus_120s,
+        "task_completion_gain_120s": task_completion_gain_120s,
+        "turn_index_at_event": turn_index_at_event,
+        "turn_index_at_event_plus_120s": turn_index_at_event_plus_120s,
+        "turn_index_delta_120s": turn_index_delta_120s,
+    }
+
     if generate_outputs:
         focus_regions = [(rg.x, rg.y, rg.radius, rg.label) for rg in regions]
         focus_detected = [(rg.x, rg.y, rg.radius, rg.label) for rg in latest_detected_regions]
@@ -3568,6 +4287,7 @@ def run_mission_once(
         log_dir=Path(args.log_dir),
         mission_seed=mission_seed,
         profile_name=profile.name,
+        reassign_algorithm=reassign_algorithm,
         scenario_profile=args.scenario_profile,
         env=env,
         regions=regions,
@@ -3590,16 +4310,19 @@ def run_mission_once(
         difficulty_discovered_time=difficulty_discovered_time,
         task_assignment_latest=task_assignment_latest,
         task_assignment_history=task_assignment_history,
+        potential_trajectory=potential_trajectory,
         max_contributors_by_region=max_contributors_by_region,
         usv_travel_m=usv_travel_m,
         usv_work_s=usv_work_s,
         usv_load_eq_m=usv_load_eq_m,
         load_balance_cv=load_balance_cv,
+        event_metrics=event_metrics,
     )
 
     return MissionSummary(
         mission_seed=mission_seed,
         profile_name=profile.name,
+        reassign_algorithm=reassign_algorithm,
         scenario_profile=args.scenario_profile,
         sea_width=env.xlim[1] - env.xlim[0],
         sea_height=env.ylim[1] - env.ylim[0],
@@ -3642,13 +4365,15 @@ def run_mission_once(
 def print_summary(
     summary: MissionSummary,
     requested_algorithm: str,
+    requested_reassign_algorithm: str,
     seed_mode: str,
     targets: MissionTargets,
 ) -> None:
     print("=== Step 3 Mission Workflow Demo ===")
     print(
         f"scenario_seed: {summary.mission_seed} (mode={seed_mode}), "
-        f"algorithm_request={requested_algorithm}, selected_algorithm={summary.profile_name}, "
+        f"planning_algo_request={requested_algorithm}, selected_planning_algo={summary.profile_name}, "
+        f"reassign_algo_request={requested_reassign_algorithm}, selected_reassign_algo={summary.reassign_algorithm}, "
         f"scenario_profile={summary.scenario_profile}"
     )
     print(f"log_file: {summary.log_path}")
@@ -3736,6 +4461,7 @@ def run_mission(args: argparse.Namespace) -> None:
     print_summary(
         summary=best,
         requested_algorithm=args.algorithm,
+        requested_reassign_algorithm=args.reassign_algorithm,
         seed_mode=args.seed_mode,
         targets=targets,
     )
@@ -3748,7 +4474,13 @@ def parse_args() -> argparse.Namespace:
         "--algorithm",
         choices=[CURRENT_ALGORITHM],
         default=CURRENT_ALGORITHM,
-        help="Current mission planning algorithm. More algorithms can be added later for comparison.",
+        help="Collaborative planning algorithm.",
+    )
+    parser.add_argument(
+        "--reassign-algorithm",
+        choices=list(REASSIGN_ALGORITHMS),
+        default=CURRENT_REASSIGN_ALGORITHM,
+        help="Task reallocation algorithm used during online replanning.",
     )
     parser.add_argument(
         "--seed-mode",

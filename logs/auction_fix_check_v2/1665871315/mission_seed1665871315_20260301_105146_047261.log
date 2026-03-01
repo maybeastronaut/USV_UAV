@@ -1,0 +1,105 @@
+=== UAV-USV Mission Log ===
+generated_at: 2026-03-01T10:51:46
+seed: 1665871315
+algorithm: hierarchical_v1
+reassign_algorithm: auction_cbba
+scenario_profile: high-coupling
+sea_area: 560m x 420m
+obstacles: 4
+tasks_total: 14
+stage1_snapshot_step: 420
+replans: 17
+executed_steps: 480
+coverage_rate: 0.9826
+task_handling_rate: 1.0000
+turn_events: 554
+turn_index: 0.031572
+load_balance_cv: 0.5148
+mission_completion_time_s: 288.00
+avg_response_time_s: 109.24
+avg_processing_completion_time_s: 116.61
+
+=== Extreme Event Metrics ===
+extreme_event_enabled: true
+extreme_event_fired: true
+extreme_event_step: 84
+extreme_event_time_s: 50.4000
+extreme_event_destroyed_usv: usv_1
+extreme_event_dispatch_uav: uav_1
+emergency_task_label: Emergency-A
+emergency_assess_time_s: 59.4000
+emergency_first_response_time_s: 214.2000
+emergency_complete_time_s: 216.0000
+event_to_assess_s: 9.0000
+event_to_first_replan_s: 3.6000
+assess_to_first_replan_s: 0.0000
+assess_to_first_response_s: 154.8000
+assess_to_complete_s: 156.6000
+coverage_at_event: 0.2902
+coverage_at_event_plus_120s: 0.7838
+coverage_recovery_120s: 0.4936
+task_completion_at_event: 0.3333
+task_completion_at_event_plus_120s: 0.7857
+task_completion_gain_120s: 0.4524
+turn_index_at_event: 0.0247
+turn_index_at_event_plus_120s: 0.0290
+turn_index_delta_120s: 0.0043
+
+=== USV Load Balance ===
+format: usv | travel_m | work_s | load_eq_m
+usv_1 | 341.3 | 0.0 | 341.3
+usv_2 | 1564.1 | 58.8 | 1693.4
+usv_3 | 1611.0 | 52.8 | 1727.1
+
+=== Task Definitions (14 tasks) ===
+format: label | true_difficulty | known_difficulty | base_sec | discovered_by@time | pos(x,y)
+Target-1 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (226.9, 126.3)
+Target-2 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (497.6, 40.2)
+Target-3 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (130.8, 303.0)
+Target-4 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (276.5, 60.2)
+Target-5 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (163.3, 286.4)
+Target-6 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (164.6, 50.4)
+Target-7 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (212.1, 76.3)
+Target-8 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (278.4, 172.7)
+Target-9 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (443.9, 146.2)
+Target-10 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (321.4, 279.2)
+Target-11 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (354.2, 67.5)
+Target-12 | 上(high) | 上(high) | 8.0s | high_coupling_init@0.0s | (225.1, 390.7)
+Emergency-A | 下(low) | 下(low) | 2.0s | uav_1_event_assess@59.4s | (28.2, 217.5)
+Emergency-B | 上(high) | 上(high) | 8.0s | uav_1_event_burst@59.4s | (35.9, 198.5)
+
+=== Task Assignment (latest) ===
+format: label | assignees | first_response | complete_time | progress/required | max_collab | status
+Target-1 | usv_2 | 49.2s | 57.0s | 8.40/8.00 | 1 | DONE
+Target-2 | usv_2,usv_3 | 134.4s | 142.2s | 8.40/8.00 | 1 | DONE
+Target-3 | usv_3 | 14.4s | 22.2s | 8.40/8.00 | 1 | DONE
+Target-4 | usv_2 | 97.2s | 105.0s | 8.40/8.00 | 1 | DONE
+Target-5 | usv_3 | 30.0s | 37.8s | 8.40/8.00 | 1 | DONE
+Target-6 | usv_2 | 16.2s | 24.0s | 8.40/8.00 | 1 | DONE
+Target-7 | usv_2 | 33.0s | 40.8s | 8.40/8.00 | 1 | DONE
+Target-8 | usv_3 | 114.0s | 121.8s | 8.40/8.00 | 1 | DONE
+Target-9 | usv_2 | 159.6s | 167.4s | 8.40/8.00 | 1 | DONE
+Target-10 | usv_3 | 140.4s | 148.2s | 8.40/8.00 | 1 | DONE
+Target-11 | usv_2 | 76.8s | 84.6s | 8.40/8.00 | 1 | DONE
+Target-12 | usv_3 | 170.4s | 178.2s | 8.40/8.00 | 1 | DONE
+Emergency-A | usv_3 | 214.2s | 216.0s | 2.40/2.00 | 1 | DONE
+Emergency-B | usv_3 | 279.6s | 287.4s | 8.40/8.00 | 1 | DONE
+
+=== Assignment History By Replan ===
+[replan 01] Target-1->usv_1 ; Target-2->usv_2 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_1 ; Target-9->usv_1 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->- ; Emergency-B->-
+[replan 02] Target-1->usv_2 ; Target-2->usv_2 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_2 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->- ; Emergency-B->-
+[replan 03] Target-1->usv_2 ; Target-2->usv_2 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_2 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->- ; Emergency-B->-
+[replan 04] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->- ; Emergency-B->-
+[replan 05] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_3 ; Target-10->usv_2 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_2
+[replan 06] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_3 ; Target-10->usv_2 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 07] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_3 ; Target-10->usv_2 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_2 ; Emergency-B->usv_2
+[replan 08] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_2 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 09] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_2 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 10] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_2 ; Emergency-B->usv_3
+[replan 11] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_2 ; Emergency-B->usv_3
+[replan 12] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_2 ; Emergency-B->usv_3
+[replan 13] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 14] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 15] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 16] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_3
+[replan 17] Target-1->usv_2 ; Target-2->usv_2,usv_3 ; Target-3->usv_3 ; Target-4->usv_2 ; Target-5->usv_3 ; Target-6->usv_2 ; Target-7->usv_2 ; Target-8->usv_3 ; Target-9->usv_2 ; Target-10->usv_3 ; Target-11->usv_2 ; Target-12->usv_3 ; Emergency-A->usv_3 ; Emergency-B->usv_3

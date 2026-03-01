@@ -341,7 +341,9 @@ def save_partition_svg(
         cell_h = (ymax - ymin) / (sim.ny - 1)
         for idx, (gx, gy) in enumerate(grid_xy):
             owner = owner_by_cell[idx]
-            base_color = computed_color_by_agent.get(owner, "#64748b")
+            base_color = computed_color_by_agent.get(owner)
+            if base_color is None:
+                continue
             pri = priority_map[idx] if idx < len(priority_map) else 0.5
             alpha = 0.18 + 0.32 * max(0.0, min(1.0, pri))
 
@@ -636,8 +638,6 @@ def save_mission_animation_html(
           <p id="taskSummary" class="panel-sub"></p>
           <p class="panel-title">已发现任务（含难度）</p>
           <div id="taskPanel" class="task-list"></div>
-          <p class="panel-title">当前任务分配</p>
-          <div id="assignPanel" class="task-list"></div>
         </div>
       </div>
       <div class="controls">
@@ -670,7 +670,6 @@ def save_mission_animation_html(
     const loadPanel = document.getElementById("loadPanel");
     const taskSummary = document.getElementById("taskSummary");
     const taskPanel = document.getElementById("taskPanel");
-    const assignPanel = document.getElementById("assignPanel");
 
     const names = Object.keys(DATA.states);
     const colors = {{}};
@@ -752,9 +751,7 @@ def save_mission_animation_html(
 
     function renderSidePanel(frameIdx, tm) {{
       const fidxKnown = Math.min(frameIdx, Math.max(0, DATA.frame_known.length - 1));
-      const fidxAssign = Math.min(frameIdx, Math.max(0, DATA.frame_assign.length - 1));
       const known = DATA.frame_known[fidxKnown] || {{}};
-      const assign = DATA.frame_assign[fidxAssign] || {{}};
 
       const discoveredLabels = Object.keys(known).sort((a, b) => {{
         const ka = taskLabelKey(a);
@@ -803,16 +800,6 @@ def save_mission_animation_html(
           return `<div class="task-row${{done ? " done" : ""}}"><b>${{escHtml(label)}}</b> | 难度: ${{escHtml(cn)}}(${{escHtml(diff)}})</div>`;
         }}).join("");
       }}
-
-      assignPanel.innerHTML = taskOrder.map((label) => {{
-        const owners = Array.isArray(assign[label]) ? assign[label] : [];
-        const ownersTxt = owners.length > 0 ? owners.join(", ") : "-";
-        const diff = String(known[label] || "unknown");
-        const cn = difficultyCN[diff] || diff;
-        const done = isDone(label, tm);
-        const status = done ? "已完成" : "处理中/待处理";
-        return `<div class="task-row${{done ? " done" : ""}}"><b>${{escHtml(label)}}</b> | 分配: ${{escHtml(ownersTxt)}} | 难度: ${{escHtml(cn)}}(${{escHtml(diff)}}) | 状态: ${{status}}</div>`;
-      }}).join("");
     }}
 
     function drawUSV(x, y, psi, c) {{
@@ -967,7 +954,8 @@ def save_mission_animation_html(
         const gy = Number(grid[1]);
         if (!Number.isFinite(gx) || !Number.isFinite(gy)) continue;
         const owner = String(ownerByCell[i] || "");
-        ctx.fillStyle = colors[owner] || "#64748b";
+        if (!owner || !Object.prototype.hasOwnProperty.call(colors, owner)) continue;
+        ctx.fillStyle = colors[owner];
 
         const cx0 = gx - partitionCellW / 2.0;
         const cy0 = gy - partitionCellH / 2.0;
@@ -995,6 +983,19 @@ def save_mission_animation_html(
       ctx.strokeRect(bx0, by0, bx1 - bx0, by1 - by0);
 
       const tm = DATA.times[Math.min(frameIdx, DATA.times.length - 1)] || 0;
+      const fidxKnown = Math.min(frameIdx, Math.max(0, DATA.frame_known.length - 1));
+      const fidxAssign = Math.min(frameIdx, Math.max(0, DATA.frame_assign.length - 1));
+      const known = DATA.frame_known[fidxKnown] || {{}};
+      const assign = DATA.frame_assign[fidxAssign] || {{}};
+      const agentPos = {{}};
+      names.forEach((name) => {{
+        const arr = DATA.states[name];
+        const maxIdx = Math.min(frameIdx, arr.length - 1);
+        if (maxIdx < 0) return;
+        const p = arr[maxIdx];
+        agentPos[name] = [p[0], p[1], p[2]];
+      }});
+
       drawCurrentField(tm);
       drawPartition(frameIdx);
 
@@ -1012,15 +1013,18 @@ def save_mission_animation_html(
         const [px, py] = toPx(r[0], r[1]);
         const rr = Math.max(5, r[2] * s);
         const label = String(r[3]);
+        const discovered = Object.prototype.hasOwnProperty.call(known, label);
         const done = isDone(label, tm);
-        const fill = done ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.10)";
-        const stroke = done ? "#15803d" : "#b91c1c";
-        const text = done ? "#166534" : "#7f1d1d";
+        const fill = done
+          ? "rgba(34,197,94,0.16)"
+          : (discovered ? "rgba(239,68,68,0.14)" : "rgba(148,163,184,0.18)");
+        const stroke = done ? "#16a34a" : (discovered ? "#dc2626" : "#64748b");
+        const text = done ? "#166534" : (discovered ? "#7f1d1d" : "#475569");
         ctx.beginPath();
         ctx.arc(px, py, rr, 0, Math.PI * 2);
         ctx.fillStyle = fill;
         ctx.strokeStyle = stroke;
-        ctx.setLineDash([6,4]);
+        ctx.setLineDash(done ? [3,3] : [6,4]);
         ctx.lineWidth = 1.4;
         ctx.fill();
         ctx.stroke();
@@ -1028,6 +1032,32 @@ def save_mission_animation_html(
         ctx.fillStyle = text;
         ctx.font = "12px sans-serif";
         ctx.fillText(label, px + 6, py - 6);
+      }});
+
+      taskOrder.forEach((label) => {{
+        const owners = Array.isArray(assign[label]) ? assign[label] : [];
+        if (owners.length === 0) return;
+        if (isDone(label, tm)) return;
+        if (!Object.prototype.hasOwnProperty.call(known, label)) return;
+        const task = DATA.regions.find((r) => String(r[3]) === label);
+        if (!task) return;
+        owners.forEach((owner, idx) => {{
+          if (!Object.prototype.hasOwnProperty.call(agentPos, owner)) return;
+          const pos = agentPos[owner];
+          const jitterAngle = (2.0 * Math.PI * idx) / Math.max(1, owners.length);
+          const tx = task[0] + 2.0 * Math.cos(jitterAngle);
+          const ty = task[1] + 2.0 * Math.sin(jitterAngle);
+          const [ax, ay] = toPx(pos[0], pos[1]);
+          const [rx, ry] = toPx(tx, ty);
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(rx, ry);
+          ctx.strokeStyle = (colors[owner] || "#2563eb") + "cc";
+          ctx.lineWidth = 1.8;
+          ctx.setLineDash([4, 3]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }});
       }});
 
       names.forEach((name) => {{

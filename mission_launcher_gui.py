@@ -104,6 +104,7 @@ class LauncherState:
     @staticmethod
     def _build_cmd(config: dict[str, Any]) -> tuple[list[str], str | None]:
         algorithm = _clamp_text(config.get("algorithm"), "hierarchical_v1")
+        reassign_algorithm = _clamp_text(config.get("reassign_algorithm"), "potential_event")
         seed_mode = _clamp_text(config.get("seed_mode"), "random")
         seed = _clamp_text(config.get("seed"), "42")
         scenario = _clamp_text(config.get("scenario_profile"), "random")
@@ -120,6 +121,8 @@ class LauncherState:
             str(DEMO_SCRIPT),
             "--algorithm",
             algorithm,
+            "--reassign-algorithm",
+            reassign_algorithm,
             "--scenario-profile",
             scenario,
             "--coverage-goal",
@@ -233,14 +236,23 @@ HTML = """<!doctype html>
       <div class="grid">
         <div class="panel">
           <div class="row">
-            <label>Algorithm</label>
+            <label>Planning Algorithm</label>
             <select id="algorithm">
               <option value="hierarchical_v1">hierarchical_v1</option>
             </select>
           </div>
           <div class="row">
+            <label>Reassign Algorithm</label>
+            <select id="reassign_algorithm">
+              <option value="potential_event" selected>potential_event</option>
+              <option value="heuristic">heuristic</option>
+              <option value="auction_cbba">auction_cbba</option>
+            </select>
+          </div>
+          <div class="row">
             <label>Scenario Profile</label>
             <select id="scenario_profile">
+              <option value="high-coupling">high-coupling</option>
               <option value="clustered">clustered</option>
               <option value="split-corners">split-corners</option>
               <option value="random" selected>random</option>
@@ -310,6 +322,7 @@ HTML = """<!doctype html>
     function payload() {
       return {
         algorithm: document.getElementById("algorithm").value,
+        reassign_algorithm: document.getElementById("reassign_algorithm").value,
         scenario_profile: document.getElementById("scenario_profile").value,
         seed_mode: document.getElementById("seed_mode").value,
         seed: document.getElementById("seed").value,
